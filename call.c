@@ -127,10 +127,16 @@ int main(int argc, char **argv) {
         printf("You are already on that floor!\n");
         exit(1);
     }
+
+    //Validate teh floors
+    if(!validate_floor(source_floor) || !validate_floor(destination_floor)) {
+        printf("Invalid floor(s) specified.\n");
+        exit(1);
+    }
     //Create a socket
     int sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd == -1) {
-        printf("Unable to connect to elevator system");
+        printf("Unable to connect to elevator system.\n");
         exit(1);
     }
     //setup the server address
@@ -161,13 +167,13 @@ int main(int argc, char **argv) {
     char *response = receive_msg(sockfd);
 
     //Process the resposne 
-    if(strncmp(response, "CAR", 4) == 0) {
-        //extract car name it is just evertyhing after car
-        printf("Car %s is arrivng. \n", response + 4);
-    } else if(strcmp(response," UNAVAILABLE") == 0) {
-        printf("Sorry, no car available to take this request. \n");
+    if(strncmp(response, "CAR ", 4) == 0) {
+        //print tje server response
+        printf("Car %s is arriving.\n", response + 4);
+    } else if(strcmp(response,"UNAVAILABLE") == 0) {
+        printf("Sorry, no car is available to take this request.\n");
     } else {
-        printf("Unable to connect to elevator system:.\n");
+        printf("Unable to connect to elevator system.\n");
     }
     free(response); //free the memeory up
     if(close(sockfd) == -1) {
