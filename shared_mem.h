@@ -19,4 +19,4 @@ typedef struct {
   uint8_t emergency_mode;          // 1 if in emergency mode, else 0
 } car_shared_mem;
 
-#endif SHARED_MEM_H
+#endif
