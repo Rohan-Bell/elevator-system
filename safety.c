@@ -1,8 +1,7 @@
 /*
 *   Safety System considerations
 *
-*   1. Using MISRA C Standards the use of printf() should not be done. These can cause buffering issues. Yet, because we need to printf as we are marking through the console we need to be explict about where
-*   we printf. To mitigate this we will use fflush() to ensre an immediate output to the terminal
+*   1. Using MISRA C Standards the use of printf() should not be done. These can cause buffering issues. Therefore write() will be used instead of printf
 *   2. Use of exit(), the MISRA C standard discourages abrupt termination. The exit function should only be used in initialization failures where continued operation would be unsafe.
 *   3. The main loop runs indefinitly using pthread_cond_wait(). This is because it should continiously supervise until external termination
 *   4. All inputs must have a comprehensive validation, thus that all shared memory fields cannot be affected by bad inputs
@@ -38,8 +37,9 @@
 *
 *
 */
+//Forcing the declaration as part of the POSIX.1-2000 standard for the use of strnlen 
+#define _POSIX_C_SOURCE 200809L
 
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -50,13 +50,24 @@
 #include <stdint.h>
 #include <signal.h>
 #include "shared_mem.h"
+#include <errno.h>
 
 //Constants that are predefined for saferty critical values
 #define SAFETY_SYSTEM_ACTIVE_VALUE 1U
 #define BOOLEAN_TRUE_VALUE 1U
-#define BOOLEAN_FALSE_VALE 0U
+#define BOOLEAN_FALSE_VALUE 0U
 #define MAX_FLOOR_STRING_LENGTH 3U
 #define MAX_STATUS_STRING_LENGTHJ 7U
+
+#define EXPECTED_ARGC 2
+#define SHM_NAME_BUFFER_SIZE 256
+#define FILE_PERMISSIONS 0666
+#define STDOUT_FD 1
+#define STDERR_FD 2
+#define BASEMENT_MIN_LEVEL 1
+#define BASEMENT_MAX_LEVEL 99
+#define FLOOR_MIN_LEVEL 1
+#define FLOOR_MAX_LEVEL 999
 
 /*Valid status strings for checking*/
 
@@ -82,40 +93,43 @@ static void handle_emergency_stop(car_shared_mem* shm);
 static void handle_overload(car_shared_mem* shm);
 static void handle_data_consistency_error(car_shared_mem* shm);
 static int check_data_consistency(car_shared_mem* shm);
+static void safe_write(int fd, const char *message); // This is to not use printf
+static int construct_shm_name(char *dest, size_t dest_size, const char *car_name);
 
 int main(int argc, char **argv){
-    if (argc != 2) {
-        fprintf(stderr, "Invalid Inputs");
-        exit(1);
+    if (argc != EXPECTED_ARGC) {
+        safe_write(STDERR_FD, "Invalid Number of Args.\n");
+        //Exit early, this is permissable as this is a critical init failure continuing would be unsafe
+        exit(EXIT_FAILURE);
     }
     const char* car_name = argv[1];
-    char shm_name[256]; //Build a shared memory object name
-    int name_result = snprintf(shm_name, sizeof(shm_name), "/car%s", car_name);
-    if (name_result < 0 || (size_t)name_result >= sizeof(shm_name)){ //force sizing and check if car nme exists
-        printf("Unable to access car %s.\n", car_name);
-        exit(1);
+    char shm_name[SHM_NAME_BUFFER_SIZE]; //Build a shared memory object name
+    if (construct_shm_name(shm_name, sizeof(shm_name), car_name) != 0) {
+        safe_write(STDERR_FD, "Error: Car name is too long or invalid.\n");
+        exit(EXIT_FAILURE);
     }
 
-    //Lets open up the shared memory]
-    int fd = shm_open(shm_name, O_RDWR, 0666);
+    //Lets open up the shared memory
+    int fd = shm_open(shm_name, O_RDWR, FILE_PERMISSIONS);
     if (fd == -1){
-        printf("Unable to access car %s.\n", car_name);
+        safe_write(STDERR_FD, "Unable to open shared memory.\n");
+        exit(EXIT_FAILURE); //Permissable as init failure again
     }
 
     // Now map the shared memory and close the file descriptor
     car_shared_mem* shm = mmap(NULL, sizeof(car_shared_mem), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (shm == MAP_FAILED) {
-        printf("Unable to access car %s.\n", car_name);
-        close(fd);
-        exit(1);
+        safe_write(STDERR_FD, "Unable to access car.\n");
+        (void)close(fd); //Attempt to close but if failed it doesn't cahnge the exit status
+        exit(EXIT_FAILURE);
     }
-    close(fd);
+    (void)close(fd);
 
     //Now we have mapped the memory and everything is setup. Can now enter safety monitoring loop
     while(1) {
-        pthread_mutex_lock(&shm->mutex); //lock down the mutex so can only access when we want,
+        (void)pthread_mutex_lock(&shm->mutex); //lock down the mutex so can only access when we want,
         //Now we want to wait for a change in the shared memory
-        pthread_cond_wait(&shm->cond, &shm->mutex); //Dooing this way elimintates risk of change between polling
+        (void)pthread_cond_wait(&shm->cond, &shm->mutex); //Dooing this way elimintates risk of change between polling
 
         //handle a heartbeat check to ensure everything is all good
         handle_safety_system_heartbeat(shm);
@@ -136,7 +150,7 @@ int main(int argc, char **argv){
         pthread_mutex_unlock(&shm->mutex); // All checks have passed unlock the mutex bbefore repeating
     }
     //The code should never reach here. But just in case unmap the memory and return
-    munmap(shm, sizeof(car_shared_mem));
+    (void)munmap(shm, sizeof(car_shared_mem));
 
 }
 
@@ -144,7 +158,7 @@ int main(int argc, char **argv){
 
 static void handle_safety_system_heartbeat(car_shared_mem* shm) {
     if (shm-> safety_system != SAFETY_SYSTEM_ACTIVE_VALUE) {
-            //Upadte the shared memory with the new value
+            //update the shared memory with the new value
         shm->safety_system = SAFETY_SYSTEM_ACTIVE_VALUE;
         
     }
@@ -152,31 +166,30 @@ static void handle_safety_system_heartbeat(car_shared_mem* shm) {
 
 static void handle_door_obstruction(car_shared_mem* shm) {
     if ((shm->door_obstruction == BOOLEAN_TRUE_VALUE) && (strcmp(shm->status, "Closing") == 0)) {
-        strcpy(shm->status, "Opening"); // Something got stuck in door open the door
+        //Using strncpy for bounded string copy rule 21.6
+        strncpy(shm->status, "Opening", sizeof(shm->status)-1); // Something got stuck in door open the door
+        shm->status[sizeof(shm->status) -1] = '\0'; //Null-termination is ensured by forcing it.
     }
 }
 
 static void handle_emergency_stop(car_shared_mem* shm) {
-    if ((shm->emergency_stop == BOOLEAN_TRUE_VALUE) && (shm->emergency_mode == BOOLEAN_FALSE_VALE)) {
+    if ((shm->emergency_stop == BOOLEAN_TRUE_VALUE) && (shm->emergency_mode == BOOLEAN_FALSE_VALUE)) {
         //If e stop is hit and not already in e stop mode 
-        printf("The emergency stop button has been pressed!\n");
-        fflush(stdout);
+        safe_write(STDERR_FD,"The emergency stop button has been pressed!\n");
         put_car_in_emergency_mode(shm);
-        shm->emergency_stop = BOOLEAN_FALSE_VALE;
+        shm->emergency_stop = BOOLEAN_FALSE_VALUE;
     }
 }
 
 static void handle_overload(car_shared_mem* shm) {
-    if ((shm->overload == BOOLEAN_TRUE_VALUE) && (shm->emergency_mode == BOOLEAN_FALSE_VALE)) {
-        printf("The overload sensor has been tripped!\n");
-        fflush(stdout);
+    if ((shm->overload == BOOLEAN_TRUE_VALUE) && (shm->emergency_mode == BOOLEAN_FALSE_VALUE)) {
+        safe_write(STDERR_FD,"The overload sensor has been tripped!\n");
         put_car_in_emergency_mode(shm);
     }
 }
 
 static void handle_data_consistency_error(car_shared_mem* shm) {
-    printf("Data consistency error!\n");
-    fflush(stdout);
+    safe_write(STDERR_FD,"Data consistency error!\n");
     put_car_in_emergency_mode(shm);
 }
 
@@ -213,28 +226,30 @@ static int check_data_consistency(car_shared_mem* shm) {
 }
 
 static int validate_floor_string(const char* floor) {
-    if (floor == NULL) return 0; //needs to be a floor
-    size_t len = strlen(floor);
+    size_t len = strnlen(floor, MAX_FLOOR_STRING_LENGTH + 2); // Check against a slightly larger value to detect overflow
     if(len == 0U || len > MAX_FLOOR_STRING_LENGTH) return 0; //Improper floor size.
+    long converted_num;
+    char *endptr;
     if(floor[0] == 'B') {
         //It is a basement floor 
         if(len < 2U) return 0; // check character sizing
-        for (size_t i = 1U; i < len; i++) {
-            if (floor[i] < '0' || floor[i] > '9') {
-                return 0; // Is a cahracter and not a number
-            }
+        errno = 0; // Reset errno before the call
+        converted_num = strtol(floor + 1, &endptr, 10);
+        // Check for conversion errors (4.7)
+        if (endptr == (floor + 1) || *endptr != '\0' || errno == ERANGE) {
+            return 0; // Not a valid number or out of range
         }
-        int basement_num = atoi(floor +1); //safe to use as must be numbers
-        return (basement_num >= 1 && basement_num <= 99) ? 1 : 0; //If 1 - 99 return true else return false
-
+        return (converted_num >= BASEMENT_MIN_LEVEL && converted_num <= BASEMENT_MAX_LEVEL) ? 1 : 0;
     } else {
         //regular floor
-        for (size_t i = 0U; i < len; i++)
-        {
-            if (floor[i] < '0' || floor[i] > '9') return 0; //check if character
+        errno = 0; // Reset errno before the call
+        converted_num = strtol(floor, &endptr, 10);
+
+        // Check for conversion errors
+        if (endptr == floor || *endptr != '\0' || errno == ERANGE) {
+            return 0; // Not a valid number or out of range
         }
-        int floor_num = atoi(floor); // safe to use as must be numbers
-        return (floor_num >= 1 && floor_num <= 999) ? 1 : 0; // Between 1 and 999
+        return (converted_num >= FLOOR_MIN_LEVEL && converted_num <= FLOOR_MAX_LEVEL) ? 1 : 0;
     }
 }
 
@@ -250,4 +265,40 @@ static int validate_status_string(const char* status) {
 
 static int check_boolean_field(uint8_t field_value) {
     return (field_value < 2U) ? 1 : 0; //Is it true or false? 1 or 0?
+}
+static void safe_write(int fd, const char *message) {
+    (void)write(fd, message, strlen(message));
+}
+
+/**
+ * @brief Safely constructs the shared memory object name.
+ *
+ * This function is a MISRA-compliant replacement for snprintf for the specific
+ * task of creating a name like "/car<name>". It performs explicit bounds
+ * checking to prevent buffer overflows.
+ *
+ * @param dest The destination buffer to write the name into.
+ * @param dest_size The total size of the destination buffer.
+ * @param car_name The name of the car to append.
+ * @return 0 on success, -1 on failure (e.g., buffer too small).
+ */
+static int construct_shm_name(char *dest, size_t dest_size, const char *car_name) {
+    const char *prefix = "/car";
+    size_t prefix_len = strlen(prefix);
+    size_t car_name_len = strlen(car_name);
+
+    // Safety Check 1: Ensure the combined length fits in the buffer.
+    // We need space for the prefix, the name, and the null terminator ('\0').
+    if ((prefix_len + car_name_len + 1) > dest_size) {
+        return -1; // Failure: Buffer is too small.
+    }
+
+    // If checks pass, it is now safe to copy the strings.
+    memcpy(dest, prefix, prefix_len);
+    memcpy(dest + prefix_len, car_name, car_name_len);
+
+    // Manually add the null terminator.
+    dest[prefix_len + car_name_len] = '\0';
+
+    return 0; // Success
 }
