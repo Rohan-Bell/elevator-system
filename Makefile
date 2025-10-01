@@ -1,4 +1,4 @@
-cc = gcc
+CC = gcc
 #I am going to enable all common warnings, enable additional warnings, compile using the C99 standard and enable multithreading support with POSIX
 CFLAGS = -Wall -Wextra -std=c99 -pthread
 #Link realtime library, link POSIX thread library
@@ -25,7 +25,7 @@ safety: safety.c
 
 #I only think I would ened a basic clean, but this can be changed later if need be
 clean:
-	rm -f car controller call inernal safety 
+	rm -f car controller call internal safety 
 
 #all and clean aren't files, don't want any cofnusion
 .PHONY: all clean
