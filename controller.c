@@ -57,7 +57,7 @@
 #define MAX_CLIENTS (MAX_CARS + 20) // Cars + some call pads
 #define MAX_QUEUE_DEPTH 20
 #define BUFFER_SIZE 256
-#define MAX_FLOOR_STR_LEN 4 // "B99" + null
+#define MAX_FLOOR_STR_LEN 8 // "B99" + null
 #define MAX_CAR_NAME_LEN 128 //half of max buffer size to ensure no memory overflow
 
 
@@ -102,8 +102,8 @@ static volatile sig_atomic_t shutdown_requested = 0;
 
 //Funciton prototypes
 void *client_handler_thread(void *arg);
-void handle_car_connection(int client_fd);
-void handle_call_connection(int client_fd);
+void handle_car_connection(int client_fd, const char* initial_message);
+void handle_call_connection(int client_fd, const char* initial_message);
 void sigint_handler(int signum);
 void setup_signal_handlers(void);
 
@@ -230,34 +230,33 @@ void *client_handler_thread(void *arg) {
         //Client has disconnected befdore sending anything
         close(client_fd);
     } else if (strncmp(buffer, "CAR", 3) == 0) {
-        free(buffer);
-        handle_car_connection(client_fd);
+        handle_car_connection(client_fd, buffer);
     } else if (strncmp(buffer, "CALL", 4) == 0) {
-        handle_call_connection(client_fd);
-        free(buffer);
+        handle_call_connection(client_fd, buffer);
         close(client_fd);
     }
-
+    //Free the initial buffer once handler done
+    if(buffer != NULL) {
+        free(buffer);
+    }
     pthread_mutex_lock(&thread_args_mutex);
     thread_args[arg_idx].in_use = 0;
     pthread_mutex_unlock(&thread_args_mutex);
     return NULL;
 }
 
-void handle_car_connection(int client_fd) {
+void handle_car_connection(int client_fd, const char* initial_message) {
     char car_name[BUFFER_SIZE];
     int min_floor, max_floor;
 
     //The initial "CAR.." ;line is consumed, get the next line
 
-    char *msg_buffer = receive_message(client_fd);
-    if(msg_buffer == NULL || parse_car_info(msg_buffer, car_name, &min_floor, &max_floor) != 0) {
+    if(parse_car_info(initial_message, car_name, &min_floor, &max_floor) != 0) {
         printf("Failed to parse car info.\n");
-        if (msg_buffer) free (msg_buffer);
         close(client_fd);
         return;
     }
-    free(msg_buffer);
+
     pthread_mutex_lock(&cars_mutex);
     int car_idx = -1;
     for (int i = 0; i < MAX_CARS; i++) {
@@ -269,6 +268,7 @@ void handle_car_connection(int client_fd) {
     if (car_idx == -1){
         pthread_mutex_unlock(&cars_mutex);
         printf("Max cars reached. Rejecting car %s.\n", car_name);
+        close(client_fd);
         return;
     }
     //car is good to go. Lets register the new car
@@ -289,7 +289,7 @@ void handle_car_connection(int client_fd) {
 
     //Loop for a status update
     while(1) {
-        msg_buffer = receive_message(client_fd);
+        char* msg_buffer = receive_message(client_fd);
         if (msg_buffer == NULL) break;
         
         int floor;
@@ -323,16 +323,13 @@ void handle_car_connection(int client_fd) {
 /**
  * @brief Handles a transient connection froma a call pad
  */
-void handle_call_connection(int client_fd){
+void handle_call_connection(int client_fd, const char* call_message){
     int source_floor, dest_floor;
 
-    char *msg_buffer = receive_message(client_fd);
-    if(msg_buffer == NULL || parse_call_info(msg_buffer, &source_floor, &dest_floor) != 0) {
+    if(call_message == NULL || parse_call_info(call_message, &source_floor, &dest_floor) != 0) {
         printf("Faield to parse call info.\n");
-        if(msg_buffer) free(msg_buffer);
         return;
     }
-    free(msg_buffer);
 
     printf("Received call from floor %d to %d.\n", source_floor, dest_floor);
     schedule_request(source_floor, dest_floor, client_fd);
@@ -581,7 +578,11 @@ int parse_call_info(const char *buffer, int *source, int *dest){
 }
 int parse_status_info(const char *buffer, int *floor, char *status_buf) {
     char floor_str[MAX_FLOOR_STR_LEN];
-    if (sscanf(buffer, "STATUS %s %s", status_buf, floor_str) != 2) {
+    char dest_str [MAX_FLOOR_STR_LEN];
+    // The format is: STATUS <status> <current_floor> <dest_floor>
+    // But we only care about status and current_floor
+    int result = sscanf(buffer, "STATUS %s %s %s", status_buf, floor_str, dest_str);
+    if (result < 2) {
         return -1;
     }
     *floor = floor_to_int(floor_str);
