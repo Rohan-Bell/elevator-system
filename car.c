@@ -168,7 +168,7 @@ int is_in_range(const char *floor) {
     return floor_compare(floor, lowest_floor) >= 0 && floor_compare(floor, highest_floor) <= 0; //Esnure floor is between range
 }
 
-void move_one_floor_towards(char *current, const char *dest) {
+void move_one_floor_towards(char *current, const char *dest, size_t buffer_size) {
     int cmp = floor_compare(current, dest);
     if (cmp < 0) {
         //current < destination therefore go up
@@ -176,13 +176,13 @@ void move_one_floor_towards(char *current, const char *dest) {
             //asement floor
             int n = atoi(current + 1);
             if (n == 1) {
-                strcpy(current, "1");
+                strncpy(current, "1", buffer_size);
             } else {
-                sprintf(current, "B%u",n-1);
+                snprintf(current, buffer_size, "B%d",n-1);
             }
         } else {
             int n = atoi(current);
-            sprintf(current, "%d", n+1);
+            snprintf(current,  buffer_size, "%d", n+1);
         }
     } else {
         //Current > destination therefroe go down
@@ -192,9 +192,9 @@ void move_one_floor_towards(char *current, const char *dest) {
         } else {
             int n = atoi(current);
             if (n == 1) {
-                strcpy(current, "B1"); // no floor 0
+                strncpy(current, "B1", buffer_size); // no floor 0
             } else {
-                sprintf(current, "%d", n -1);
+                snprintf(current, buffer_size, "%d", n -1);
             }
         }
     }
@@ -224,7 +224,7 @@ void *controller_thread(void *arg) {
                 //Controller connected send update
                 send_status_update();
             } else {
-                usleep(delay_ms * 1000);
+                usleep(delay_ms  * MILLISECOND);
                 continue;
             }
         }
@@ -249,7 +249,7 @@ void *controller_thread(void *arg) {
             free(recv_msg); //free up any unnecessary buffer
         }
     }
-    usleep(delay_ms*1000);
+    usleep(delay_ms  * MILLISECOND);
     return NULL;
 }
 
@@ -261,7 +261,7 @@ void open_door_sequence(void) {
     pthread_mutex_unlock(&shm->mutex);
     send_status_update();
 
-    usleep(delay_ms);
+    usleep(delay_ms  * MILLISECOND);
     pthread_mutex_lock(&shm->mutex);
     if(strcmp(shm->status, "Opening") == 0) {
         strcpy(shm->status, "Open");
@@ -270,17 +270,18 @@ void open_door_sequence(void) {
     pthread_mutex_unlock(&shm->mutex);
     send_status_update();
 
-    usleep(delay_ms);
+    usleep(delay_ms * MILLISECOND);
 
     pthread_mutex_lock(&shm->mutex);
-    if(strcmp(shm->status, "Open") == 0) {
+    //Check to see if the status is open or already closing cannot be anything else
+    if(strcmp(shm->status, "Open") == 0 || strcmp(shm->status, "Closing") == 0) {
         strcpy(shm->status, "Closing");
         pthread_cond_broadcast(&shm->cond);
     }
     pthread_mutex_unlock(&shm->mutex);
     send_status_update();
 
-    usleep(delay_ms);
+    usleep(delay_ms  * MILLISECOND);
 
     pthread_mutex_lock(&shm->mutex);
     if(strcmp(shm->status, "Closing") == 0) {
@@ -292,16 +293,19 @@ void open_door_sequence(void) {
 }
 
 void handle_buttons(void) {
-    pthread_mutex_unlock(&shm->mutex);
+    pthread_mutex_lock(&shm->mutex);
     if(shm->open_button == 1) {
         shm->open_button = 0;
-        if (strcmp(shm->status, "Closing") == 0 || strcmp(shm->status, "Closed") == 0) {
-            strcpy(shm->status, "Opening");
-            pthread_cond_broadcast(&shm->cond);
+        //Trigger open sequenecv if the dorrs are closed or clsoing and the car is stationary
+
+        if (strcmp(shm->current_floor, shm->destination_floor) == 0 && (strcmp(shm->status, "Closing") == 0 || strcmp(shm->status, "Closed") == 0)) {
+            pthread_mutex_unlock(&shm->mutex);
+            open_door_sequence();
+            return; //The seuqnece was handled so we can exit function early
         }
     }
     if (shm->close_button == 1) {
-        shm->close_button = 0;
+        shm->close_button = 0; // reset button state
         if (strcmp(shm->status, "Open") == 0) {
             strcpy(shm->status, "Closing");
             pthread_cond_broadcast(&shm->cond);
@@ -316,12 +320,11 @@ void *main_operation_thread(void *arg) {
     clock_gettime(CLOCK_MONOTONIC, &last_safety_check);
     
     while (!should_exit) {
-        usleep(100);  // 100 microseconds for responsiveness
         
         // Safety system heartbeat check based on actual time
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
-        long elapsed_ms = (now.tv_sec - last_safety_check.tv_sec) * 1000 + 
+        long elapsed_ms = (now.tv_sec - last_safety_check.tv_sec) * MILLISECOND + 
                          (now.tv_nsec - last_safety_check.tv_nsec) / 1000000;
         
         if (elapsed_ms >= delay_ms) {
@@ -371,7 +374,7 @@ void *main_operation_thread(void *arg) {
                         pthread_cond_broadcast(&shm->cond);
                         pthread_mutex_unlock(&shm->mutex);
                         
-                        usleep(delay_ms * 1000);
+                        usleep(delay_ms  * MILLISECOND);
                         
                         pthread_mutex_lock(&shm->mutex);
                         strncpy(shm->current_floor, shm->destination_floor, sizeof(shm->current_floor) - 1);
@@ -393,30 +396,35 @@ void *main_operation_thread(void *arg) {
         if (strcmp(shm->status, "Closed") == 0) {
             int cmp = floor_compare(shm->current_floor, shm->destination_floor);
             
-            if (cmp == 0) {
-                pthread_mutex_unlock(&shm->mutex);
-            } else {
+            if (cmp != 0) {
+                //Change status to between to start the actual journey
                 strcpy(shm->status, "Between");
                 pthread_cond_broadcast(&shm->cond);
                 pthread_mutex_unlock(&shm->mutex);
-                send_status_update();
-                
-                usleep(delay_ms * 1000);
-                
-                pthread_mutex_lock(&shm->mutex);
-                move_one_floor_towards(shm->current_floor, shm->destination_floor);
-                strcpy(shm->status, "Closed");
-                pthread_cond_broadcast(&shm->cond);
+                send_status_update(); // status between ... message
+
+                //lets loop until we get to our destination
+                while(floor_compare(shm->current_floor, shm->destination_floor) != 0 && !should_exit) {
+                    usleep(delay_ms  * MILLISECOND);
+                    pthread_mutex_lock(&shm->mutex);
+                    move_one_floor_towards(shm->current_floor, shm->destination_floor, sizeof(shm->current_floor));
+                    //Chjeck if we have arrived 
+                    if (floor_compare(shm->current_floor, shm->destination_floor) ==0) {
+                        //Destination has been reached and we need to unlock and start the door sequenece
+                        pthread_mutex_unlock(&shm->mutex);
+                        open_door_sequence();
+                        break; // Nog longer in the movement loop leave it
+                    } else {
+                        //Not at the floor send a status update
+                        pthread_mutex_unlock(&shm->mutex);
+                        send_status_update();
+                    }
+                    
+                } 
+
+            } else {
+                //Current floor is the destination floor so we do not need to do anyhthing until given a new dest
                 pthread_mutex_unlock(&shm->mutex);
-                send_status_update();
-                
-                pthread_mutex_lock(&shm->mutex);
-                if (strcmp(shm->current_floor, shm->destination_floor) == 0) {
-                    pthread_mutex_unlock(&shm->mutex);
-                    open_door_sequence();
-                } else {
-                    pthread_mutex_unlock(&shm->mutex);
-                }
             }
         } else {
             pthread_mutex_unlock(&shm->mutex);

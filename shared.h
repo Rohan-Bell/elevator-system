@@ -25,6 +25,8 @@
 
 #define MAX_FLOOR 999
 #define MIN_FLOOR 99 //Keep in mind it is B99 not 99
+#define MILLISECOND 1000
+#define DELAY 0
 
 // Network utility functions
 void recv_looped(int fd, void *buf, size_t sz);
