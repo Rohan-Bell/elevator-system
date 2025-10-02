@@ -39,20 +39,8 @@
  *      this I deemed as an acceptable change and justification.
  */
 
-#include <stdio.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <pthread.h>
-#include <signal.h>
-#include <errno.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
+#include "shared.h"
 
-
-#define PORT 3000
 #define MAX_CARS 10
 #define MAX_CLIENTS (MAX_CARS + 20) // Cars + some call pads
 #define MAX_QUEUE_DEPTH 20
@@ -117,14 +105,10 @@ void remove_from_queue(int *queue, int *size, int index);
 void send_next_destination(Car *car);
 
 //Utility
-int floor_to_int(const char *floor_str);
 int parse_car_info(const char *buffer, char *name, int *min_floor, int *max_floor);
 int parse_call_info(const char *buffer, int *source, int *dest);
 int parse_status_info(const char *buffer, int *floor, char *status_buf);
 void safe_write(int fd, const char *message);
-
-char* receive_message(int fd);
-int send_message(int fd, const char *message);
 
 //The main function 
 int main() {
@@ -154,7 +138,7 @@ int main() {
     memset(&serv_addr, 0 , sizeof(serv_addr));
     serv_addr.sin_family = AF_INET; // Keep in mind ipv4 not ipv6
     serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    serv_addr.sin_port = htons(PORT);
+    serv_addr.sin_port = htons(CONTROLLER_PORT);
 
     //Bind the socket now
     if (bind(listen_fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0 ) { //would return -1 if bad
@@ -169,7 +153,7 @@ int main() {
         return EXIT_FAILURE;
     }
 
-    printf("Controller listening on port %d\n", PORT);
+    printf("Controller listening on port %d\n", CONTROLLER_PORT);
 
     //the actual main accept loop, where we check if CTRL+C
     while (!shutdown_requested){
@@ -550,13 +534,6 @@ void sigint_handler(int signum) {
     }
   }
 
-  int floor_to_int(const char *floor_str) {
-    if(floor_str == NULL) return 0;
-    if (floor_str[0] == 'B') {
-        return -atoi(floor_str + 1);
-    }
-    return atoi(floor_str);
-  }
 
 int parse_car_info(const char *buffer, char *name, int *min_floor, int *max_floor) {
     char min_str[MAX_FLOOR_STR_LEN], max_str[MAX_FLOOR_STR_LEN];
@@ -593,64 +570,4 @@ int parse_status_info(const char *buffer, int *floor, char *status_buf) {
     if (write(fd, message, strlen(message)) < 0) {
         perror("write failed");
     }
-}
-
-char* receive_message(int fd) {
-    uint16_t length_net;
-    ssize_t bytes_read;
-    bytes_read = read(fd, &length_net, sizeof(length_net));
-    if(bytes_read != sizeof(length_net)) {
-        return NULL;
-    }
-
-    uint16_t length = ntohs(length_net);
-    if(length == 0 || length >= BUFFER_SIZE) {
-        return NULL;
-    }
-
-    //Allocate buffer for message and add space for null term
-    char *buffer = (char*)malloc(length+1);
-    if(buffer == NULL) {
-        return NULL;
-    }
-
-    //Read the message
-    size_t total_read = 0;
-    while (total_read < length) {
-        bytes_read = read(fd, buffer + total_read, length - total_read);
-        if(bytes_read <= 0) {
-            free(buffer);
-            return NULL;
-        }
-        total_read += bytes_read;
-    }
-    buffer[length] = '\0';
-    return buffer;
-}
-
-
-/**
- * @brief Sends a length-prefixed message to a socket
- * @return 0 on success, -1 on error
- */
-int send_message(int fd, const char *message) {
-    uint16_t length = strlen(message);
-    uint16_t length_net = htons(length);
-    
-    // Send length prefix
-    if (write(fd, &length_net, sizeof(length_net)) != sizeof(length_net)) {
-        return -1;
-    }
-    
-    // Send message
-    size_t total_sent = 0;
-    while (total_sent < length) {
-        ssize_t sent = write(fd, message + total_sent, length - total_sent);
-        if (sent <= 0) {
-            return -1;
-        }
-        total_sent += sent;
-    }
-    
-    return 0;
 }

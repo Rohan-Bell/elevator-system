@@ -9,16 +9,7 @@ up sets the destination floor to the enxt floor up from current floor. useabl wh
 down sets the dest floor to the next down from current. Usable in service mode, elevtor not nmoving and door closed
 */
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <pthread.h>
-#include <stdint.h>
-#include "shared_mem.h"
+#include "shared.h"
 
 //Check to see if it is a basement or normal floor
 int is_basement_floor(const char* floor) {
