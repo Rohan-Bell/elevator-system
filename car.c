@@ -173,12 +173,12 @@ void *controller_thread(void *arg) {
     while(!should_exit) {
         pthread_mutex_lock(&shm->mutex);
         //Wait for the safety system
-        while(shm->safety_system != 1 && !should_exit && shm->individual_service_mode == 0 && shm->emergency_mode == 0) {
+        while((shm->safety_system != 1 || shm->individual_service_mode == 1 || shm->emergency_mode == 1) && !should_exit) {
             pthread_cond_wait(&shm->cond, &shm->mutex);
         }
+        int emergency = shm->emergency_mode;
         pthread_mutex_unlock(&shm->mutex);
-
-        if(should_exit) break; // ctrl + c pressed
+        if(should_exit || emergency) break; // ctrl + c pressed
         //Check to see if we should be connected
         pthread_mutex_lock(&shm->mutex);
         int should_connect = (shm->individual_service_mode == 0 && shm->emergency_mode == 0 && shm->safety_system == 1);
@@ -195,22 +195,25 @@ void *controller_thread(void *arg) {
             }
         }
 
+        pthread_mutex_lock(&controller_mutex);
+        int local_fd = controller_fd;
+        pthread_mutex_unlock(&controller_mutex);
         //Handle messages the controller
-        if(controller_fd != -1){
+        if(local_fd != -1){
                 // Use a timeout-based receive or non-blocking read
             fd_set read_fds;
             FD_ZERO(&read_fds);
-            FD_SET(controller_fd, &read_fds);
+            FD_SET(local_fd, &read_fds);
             struct timeval timeout = {0, delay_ms * MILLISECOND};  // timeout = delay_ms
-            int ready = select(controller_fd + 1, &read_fds, NULL, NULL, &timeout);
+            int ready = select(local_fd + 1, &read_fds, NULL, NULL, &timeout);
             if (ready > 0) {
                 // printf("[DEBUG] controller_thread: About to call receive_msg, fd=%d\n", controller_fd);
-                char *recv_msg = receive_msg(controller_fd);
+                char *recv_msg = receive_msg(local_fd);
                 // printf("[DEBUG] controller_thread: Received message: '%s' (or NULL)\n", 
                 //     recv_msg ? recv_msg : "NULL");
                 if(recv_msg == NULL) {
                     disconnect_from_controller();
-                    break;
+                    continue; // wait for reconnection
                 }
                 if(strncmp(recv_msg, "FLOOR", 5) == 0) {
                     char floor[8];
@@ -446,6 +449,9 @@ void *main_operation_thread(void *arg) {
             if (controller_fd != -1 && shm->individual_service_mode == 0 && shm->emergency_mode == 0) {
                 if (shm->safety_system == 1) {
                     shm->safety_system = 2;
+                    pthread_cond_broadcast(&shm->cond);
+                } else if (shm->safety_system == 2) {
+                    shm->safety_system = 3;
                     pthread_cond_broadcast(&shm->cond);
                 } else if (shm->safety_system >= 3) {
                     printf("Safety system disconnected! Entering emergency mode.\n");
