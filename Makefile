@@ -7,7 +7,7 @@ LDFLAGS = -lrt -lpthread
 #Object files
 SHARED_OBJS = shared_utils.o
 # Executables
-TARGETS = car call_car internal_controls safety controller
+TARGETS = car call internal safety controller
 
 #Create all 5 executables
 all: $(TARGETS)

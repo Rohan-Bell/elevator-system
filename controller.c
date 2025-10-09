@@ -208,7 +208,7 @@ void *client_handler_thread(void *arg) {
     int arg_idx = (intptr_t)arg;
     //get the client file descriptor from the static pool
     int client_fd = thread_args[arg_idx].client_fd;
-    char *buffer = receive_message(client_fd);
+    char *buffer = receive_msg(client_fd);
 
     if (buffer == NULL) {
         //Client has disconnected befdore sending anything
@@ -273,7 +273,7 @@ void handle_car_connection(int client_fd, const char* initial_message) {
 
     //Loop for a status update
     while(1) {
-        char* msg_buffer = receive_message(client_fd);
+        char* msg_buffer = receive_msg(client_fd);
         if (msg_buffer == NULL) break;
         
         int floor;

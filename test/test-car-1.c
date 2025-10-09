@@ -108,7 +108,7 @@ void displaycond(car_shared_mem *s)
   struct timespec now;
   clock_gettime(CLOCK_MONOTONIC, &now);
   pthread_mutex_lock(&s->mutex);
-  printf("[TEST at %ld.%03ld] Current state: {%s, %s, %s, %d, %d, %d, %d, %d, %d, %d}\n",
+  printf("Current state: {%s, %s, %s, %d, %d, %d, %d, %d, %d, %d}\n",
     s->current_floor,
     s->destination_floor,
     s->status,
