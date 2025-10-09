@@ -207,10 +207,17 @@ void *controller_thread(void *arg) {
             struct timeval timeout = {0, delay_ms * MILLISECOND};  // timeout = delay_ms
             int ready = select(local_fd + 1, &read_fds, NULL, NULL, &timeout);
             if (ready > 0) {
-                // printf("[DEBUG] controller_thread: About to call receive_msg, fd=%d\n", controller_fd);
+                // Recheck if controller is still connected (might have been closed by main thread)
+                pthread_mutex_lock(&controller_mutex);
+                int still_connected = (controller_fd == local_fd);
+                pthread_mutex_unlock(&controller_mutex);
+                
+                if (!still_connected) {
+                    // Connection was closed, skip read
+                    continue;
+                }
+                
                 char *recv_msg = receive_msg(local_fd);
-                // printf("[DEBUG] controller_thread: Received message: '%s' (or NULL)\n", 
-                //     recv_msg ? recv_msg : "NULL");
                 if(recv_msg == NULL) {
                     disconnect_from_controller();
                     continue; // wait for reconnection
@@ -228,6 +235,9 @@ void *controller_thread(void *arg) {
                     pthread_mutex_unlock(&shm->mutex); //Unlock the shared memorey as we are done with it
                 }
             free(recv_msg); //free up any unnecessary buffer
+            } else if (ready < 0) {
+                // select() error (e.g., bad file descriptor) - disconnect
+                disconnect_from_controller();
             }
         } else {
             //only sleep if controller not connected
@@ -397,7 +407,7 @@ void handle_buttons(void) {
         return;
     }
     
-    // Normal mode - close button has highest priority
+    // Normal mode - close button has highest priority when door is Open
     if (shm->close_button == 1 && strcmp(shm->status, "Open") == 0) {
         shm->close_button = 0;
         strcpy(shm->status, "Closing");
@@ -417,9 +427,9 @@ void handle_buttons(void) {
         return;
     }
 
+    // Normal mode - open button when at destination floor
     if(shm->open_button == 1 && strcmp(shm->current_floor, shm->destination_floor) == 0 && 
-        (strcmp(shm->status, "Closing") == 0 || strcmp(shm->status, "Closed") == 0)) {
-        shm->open_button = 0;
+        strcmp(shm->status, "Closed") == 0) {
         pthread_mutex_unlock(&shm->mutex);
         open_door_sequence();
         return;
@@ -474,6 +484,7 @@ void *main_operation_thread(void *arg) {
         pthread_mutex_lock(&shm->mutex);
         int is_individual_mode = shm->individual_service_mode;
         int is_emergency = shm->emergency_mode;
+        int current_status_is_closed = (strcmp(shm->status, "Closed") == 0);
         pthread_mutex_unlock(&shm->mutex);
         
         // Handle buttons (handles doors in individual service mode)
@@ -482,6 +493,12 @@ void *main_operation_thread(void *arg) {
         }
         
         pthread_mutex_lock(&shm->mutex);
+        
+        // If handle_buttons changed the status, skip the rest of this iteration
+        if (current_status_is_closed && strcmp(shm->status, "Closed") != 0) {
+            pthread_mutex_unlock(&shm->mutex);
+            continue;
+        }
         
         // Handle mode changes
         if (shm->individual_service_mode == 1) {
@@ -583,7 +600,7 @@ void *main_operation_thread(void *arg) {
             } else {
                 //Current floor is the destination floor so we do not need to do anyhthing until given a new dest
                 pthread_mutex_unlock(&shm->mutex);
-                my_usleep(delay_ms * MILLISECOND);
+                my_usleep(1 * MILLISECOND);  // Check frequently for button presses
             }
         } else {
             pthread_mutex_unlock(&shm->mutex);
@@ -616,10 +633,6 @@ int main(int argc, char **argv) {
     
     pthread_join(main_thread, NULL);
     pthread_join(ctrl_thread, NULL);
-    if (shm && !cleanup_in_progress) {
-        pthread_mutex_destroy(&shm->mutex);
-        pthread_cond_destroy(&shm->cond);
-    }
     
     // Cleanup
     if (shm) {
