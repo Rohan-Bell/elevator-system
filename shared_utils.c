@@ -12,7 +12,7 @@ void recv_looped(int fd, void *buf, size_t sz) {
             exit(1);
         }
         if (received == 0) { //The connection is closed by the other end
-            fprintf(stderr, "Connection closed unexpectedly\n");
+            //fprintf(stderr, "Connection closed unexpectedly\n");
             exit(1);
         }
         //We can move the pointer forwad and decrease remainng bytes needed 

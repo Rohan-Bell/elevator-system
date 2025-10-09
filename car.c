@@ -16,6 +16,7 @@ static char lowest_floor[8];
 static char highest_floor[8];
 
 static volatile sig_atomic_t cleanup_in_progress = 0;
+static volatile int destination_changed = 0; //bool to see when dest changed
 
 //Function definitions 
 void setup_signal_handler(void);
@@ -211,17 +212,17 @@ void *controller_thread(void *arg) {
                     disconnect_from_controller();
                     break;
                 }
-                if(strncmp(recv_msg, "FLOOR", 6) == 0) {
+                if(strncmp(recv_msg, "FLOOR", 5) == 0) {
                     char floor[8];
                     sscanf(recv_msg + 6, "%s", floor);
                     pthread_mutex_lock(&shm->mutex);
                     //Allow setting destiantion event between
                     if(is_in_range(floor)) {
                         strncpy(shm->destination_floor, floor, sizeof(shm->destination_floor) -1);
+                        destination_changed =1;
                         pthread_cond_broadcast(&shm->cond);
                     }
                     pthread_mutex_unlock(&shm->mutex); //Unlock the shared memorey as we are done with it
-                    send_status_update();
                 }
             free(recv_msg); //free up any unnecessary buffer
             }
@@ -529,7 +530,12 @@ void *main_operation_thread(void *arg) {
         if (strcmp(shm->status, "Closed") == 0) {
             int cmp = floor_compare(shm->current_floor, shm->destination_floor);
             
-            if (cmp != 0) {
+            if (cmp == 0 && destination_changed) {
+                // Controller sent us to current floor - open doors
+                destination_changed = 0;
+                pthread_mutex_unlock(&shm->mutex);
+                open_door_sequence();
+            } else if (cmp != 0) {
                 //Change status to between to start the actual journey
                 strcpy(shm->status, "Between");
                 pthread_cond_broadcast(&shm->cond);
@@ -549,6 +555,7 @@ void *main_operation_thread(void *arg) {
                             //Check if we have arrived 
                             if (floor_compare(shm->current_floor, shm->destination_floor) ==0) {
                                 //Destination has been reached and we need to unlock and start the door sequenece
+                                destination_changed = 0; // Clear flag
                                 pthread_mutex_unlock(&shm->mutex);
                                 open_door_sequence();
                                 break; // Nog longer in the movement loop leave it
