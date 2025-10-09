@@ -1,7 +1,8 @@
-#define _POSIX_C_SOURCE 199309L
+#define _POSIX_C_SOURCE 200809L
 #include <unistd.h>
 #include "shared.h"
 #include <time.h>
+#include <sys/select.h>
 
 static car_shared_mem *shm = NULL;
 static int shm_fd = -1;
@@ -13,6 +14,8 @@ static volatile int should_exit = 0;
 static char car_name[64];
 static char lowest_floor[8];
 static char highest_floor[8];
+
+static volatile sig_atomic_t cleanup_in_progress = 0;
 
 //Function definitions 
 void setup_signal_handler(void);
@@ -40,8 +43,11 @@ void setup_signal_handler(void) {
 void signal_handler(int sig){
     if (sig == SIGINT) {
         should_exit = 1;
+        cleanup_in_progress = 1;
         if (shm) {
+            pthread_mutex_lock(&shm->mutex);
             pthread_cond_broadcast(&shm -> cond);
+            pthread_mutex_unlock(&shm->mutex);
         }
     }
 }
@@ -69,7 +75,7 @@ void init_shared_memory(void) {
     shm = mmap(NULL, sizeof(car_shared_mem), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
     if(shm == MAP_FAILED){
         perror("mmap");
-    exit(1);
+        exit(1);
     }  
     if (created) {
         //Initialise the mutex with a shared attribute
@@ -87,9 +93,17 @@ void init_shared_memory(void) {
         pthread_condattr_destroy(&cond_attr);
     }
 
+    //Validate the floor name lengths
+    if (strlen(lowest_floor) >= sizeof(shm->current_floor) ||
+        strlen(highest_floor) >= sizeof(shm->destination_floor)) {
+        fprintf(stderr, "Floor names too long\n");
+        exit(1);
+    }
     //Initialise the values using strncpy
     strncpy(shm->current_floor, lowest_floor, sizeof(shm->current_floor) -1);
+    shm->current_floor[sizeof(shm->current_floor) -1] = '\0';
     strncpy(shm->destination_floor, lowest_floor, sizeof(shm->destination_floor) -1);
+    shm->destination_floor[sizeof(shm->destination_floor) -1] = '\0';
     strcpy(shm->status, "Closed"); //closed to start
     //Set to default values
     shm->open_button = 0;
@@ -100,6 +114,11 @@ void init_shared_memory(void) {
     shm->emergency_stop =0;
     shm->emergency_mode = 0;
     shm-> individual_service_mode =0;
+
+    // printf("[DEBUG] init_shared_memory: shm=%p, shm_fd=%d, name=%s\n", 
+    //    (void*)shm, shm_fd, shm_name);
+    // printf("[DEBUG] init_shared_memory: current_floor='%s', dest='%s', status='%s'\n",
+    //    shm->current_floor, shm->destination_floor, shm->status);
 }
 
 
@@ -244,54 +263,80 @@ void *controller_thread(void *arg) {
 
         //Handle messages the controller
         if(controller_fd != -1){
-            char *recv_msg = receive_msg(controller_fd);
-            if(recv_msg == NULL) {
-                disconnect_from_controller();
-                continue;
-            }
-            if(strncmp(recv_msg, "FLOOR", 6) == 0) {
-                char floor[8];
-                sscanf(recv_msg + 6, "%s", floor);
-                pthread_mutex_lock(&shm->mutex);
-                //Allow setting destiantion event between
-                if(is_in_range(floor)) {
-                    strncpy(shm->destination_floor, floor, sizeof(shm->destination_floor) -1);
-                    pthread_cond_broadcast(&shm->cond);
+                // Use a timeout-based receive or non-blocking read
+            fd_set read_fds;
+            FD_ZERO(&read_fds);
+            FD_SET(controller_fd, &read_fds);
+            struct timeval timeout = {0, delay_ms * MILLISECOND};  // timeout = delay_ms
+            int ready = select(controller_fd + 1, &read_fds, NULL, NULL, &timeout);
+            if (ready > 0) {
+                // printf("[DEBUG] controller_thread: About to call receive_msg, fd=%d\n", controller_fd);
+                char *recv_msg = receive_msg(controller_fd);
+                // printf("[DEBUG] controller_thread: Received message: '%s' (or NULL)\n", 
+                //     recv_msg ? recv_msg : "NULL");
+                if(recv_msg == NULL) {
+                    disconnect_from_controller();
+                    break;
                 }
-                pthread_mutex_unlock(&shm->mutex); //Unlock the shared memorey as we are done with it
-                send_status_update();
-            }
+                if(strncmp(recv_msg, "FLOOR", 6) == 0) {
+                    char floor[8];
+                    sscanf(recv_msg + 6, "%s", floor);
+                    pthread_mutex_lock(&shm->mutex);
+                    //Allow setting destiantion event between
+                    if(is_in_range(floor)) {
+                        strncpy(shm->destination_floor, floor, sizeof(shm->destination_floor) -1);
+                        pthread_cond_broadcast(&shm->cond);
+                    }
+                    pthread_mutex_unlock(&shm->mutex); //Unlock the shared memorey as we are done with it
+                    send_status_update();
+                }
             free(recv_msg); //free up any unnecessary buffer
+            }
+        } else {
+            //only sleep if controller not connected
+            my_usleep(delay_ms  * MILLISECOND);
         }
     }
-    my_usleep(delay_ms  * MILLISECOND);
     return NULL;
+}
+
+void add_ms(struct timespec *t, long ms) {
+    t->tv_sec  += ms / 1000;
+    t->tv_nsec += (ms % 1000) * 1000000L;
+    if (t->tv_nsec >= 1000000000L) {
+        t->tv_sec++;
+        t->tv_nsec -= 1000000000L;
+    }
 }
 
 
 void open_door_sequence(void) {
-    struct timespec start_time, now;
+    struct timespec start_time;
     clock_gettime(CLOCK_MONOTONIC, &start_time);
-    //set the opening state
-    pthread_mutex_lock(&shm->mutex); //lock set door status to Opening and then unlock mutex
+    printf("[TIMING] open_door_sequence START at %ld.%09ld\n", start_time.tv_sec, start_time.tv_nsec);
+
+    // --- Opening at t=0 ---
+    pthread_mutex_lock(&shm->mutex);
+    shm->open_button = 0;
     strcpy(shm->status, "Opening");
     pthread_cond_broadcast(&shm->cond);
     pthread_mutex_unlock(&shm->mutex);
+    printf("[TIMING] Status set to Opening at t=0\n");
     send_status_update();
 
-    my_usleep(delay_ms  * MILLISECOND);
+    // --- Open at t=delay_ms ---
+    struct timespec open_time = start_time;
+    add_ms(&open_time, delay_ms);
+    printf("[TIMING] Will transition to Open at t=%d ms (target: %ld.%09ld)\n", 
+           delay_ms, open_time.tv_sec, open_time.tv_nsec);
+    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &open_time, NULL);
 
-    //Calcualte how much time has elapsed
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    long elapsed_ms = (now.tv_sec - start_time.tv_sec) * MILLISECOND +
-                        (now.tv_nsec - start_time.tv_nsec) / 1000000;
-    //Adjust the remaing sleep time to account for overhead of sending status updates
-    long remaining_ms = delay_ms - elapsed_ms;
-    if (remaining_ms > 0) {
-        my_usleep(remaining_ms * MILLISECOND);
-    }
+    struct timespec now1;
+    clock_gettime(CLOCK_MONOTONIC, &now1);
+    long elapsed1 = (now1.tv_sec - start_time.tv_sec) * 1000 + 
+                    (now1.tv_nsec - start_time.tv_nsec) / 1000000;
+    printf("[TIMING] Woke up after %ld ms, transitioning to Open\n", elapsed1);
 
-    //Now set to the Open State - this shopuld happen at the delay_ms and include the overhead of sending status
     pthread_mutex_lock(&shm->mutex);
     if(strcmp(shm->status, "Opening") == 0) {
         strcpy(shm->status, "Open");
@@ -300,54 +345,71 @@ void open_door_sequence(void) {
     pthread_mutex_unlock(&shm->mutex);
     send_status_update();
 
-    //Wait while in the open state but we got to wake up periodically to check if the close button ahs been pressedd
-    clock_gettime(CLOCK_MONOTONIC, &start_time);
+    // --- Wait in Open state until close_button or t=2*delay_ms ---
+    struct timespec close_time = start_time;
+    add_ms(&close_time, 2 * delay_ms);
+    printf("[TIMING] Will auto-close at t=%d ms (target: %ld.%09ld)\n", 
+           2 * delay_ms, close_time.tv_sec, close_time.tv_nsec);
 
     while (1) {
-        pthread_mutex_lock(&shm->mutex);
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
 
-        //Lets check if the close button was pressed while the door was open otherwsie we will do normal closing sequence
+        pthread_mutex_lock(&shm->mutex);
+        
+        // 1. If user pressed close_button early
         if (shm->close_button == 1 && strcmp(shm->status, "Open") == 0) {
             shm->close_button = 0;
+            struct timespec close_button_time;
+            clock_gettime(CLOCK_MONOTONIC, &close_button_time);
+            double elapsed = (close_button_time.tv_sec - start_time.tv_sec) + 
+                            (close_button_time.tv_nsec - start_time.tv_nsec) / 1e9;
+            printf("[TIMING] Close button pressed at t=%.3f ms, recalculating closed_time\n", elapsed * 1000);
+            
             strcpy(shm->status, "Closing");
             pthread_cond_broadcast(&shm->cond);
             pthread_mutex_unlock(&shm->mutex);
             send_status_update();
-            break; // exit the waiting loop immediately
+            break;
         }
-        //Check fi status changed for any other reason
-        if(strcmp(shm->status, "Open") != 0) {
+        
+        // if state changed externally
+        if (strcmp(shm->status, "Open") != 0) {
             pthread_mutex_unlock(&shm->mutex);
             break;
         }
+        
         pthread_mutex_unlock(&shm->mutex);
 
-        //Havce we waited long enough for the door to close?
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        long elapsed_ms = (now.tv_sec - start_time.tv_sec) * MILLISECOND +
-                        (now.tv_nsec - start_time.tv_nsec) / 1000000;
-        if (elapsed_ms >= delay_ms) {
-            //Time is up lets close on up
+        // 2. If scheduled close time has arrived
+        if ((now.tv_sec > close_time.tv_sec) ||
+            (now.tv_sec == close_time.tv_sec && now.tv_nsec >= close_time.tv_nsec)) {
+            long elapsed_auto = (now.tv_sec - start_time.tv_sec) * 1000 + 
+                                (now.tv_nsec - start_time.tv_nsec) / 1000000;
+            printf("[TIMING] Auto-close time reached at t=%ld ms, transitioning to Closing\n", elapsed_auto);
             pthread_mutex_lock(&shm->mutex);
             if(strcmp(shm->status, "Open") == 0) {
                 strcpy(shm->status, "Closing");
+                pthread_cond_broadcast(&shm->cond);
             }
             pthread_mutex_unlock(&shm->mutex);
             send_status_update();
             break;
         }
 
-        //Sleep for a very short time before checking again
-        my_usleep(1* MILLISECOND);
-
-
+        my_usleep(1000);  // 1ms
+        
     }
 
-    //Complete the closing sequence
-    my_usleep(delay_ms * MILLISECOND);
-    pthread_mutex_lock(&shm->mutex);
+    // --- Closing phase ---struct timespec closing_start;
+    struct timespec closing_start;
+    clock_gettime(CLOCK_MONOTONIC, &closing_start);
+    struct timespec new_closed_time = closing_start;
+    add_ms(&new_closed_time, delay_ms);
 
+    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &new_closed_time, NULL);
+
+    pthread_mutex_lock(&shm->mutex);
     if (strcmp(shm->status, "Closing") == 0) {
         strcpy(shm->status, "Closed");
         pthread_cond_broadcast(&shm->cond);
@@ -497,6 +559,8 @@ void *main_operation_thread(void *arg) {
                         //Check fi we should still be moving i.e. not emergency not service
                         if (shm->emergency_mode == 0 && strcmp(shm->status, "Between") == 0){
                             move_one_floor_towards(shm->current_floor, shm->destination_floor, sizeof(shm->current_floor));
+                            // printf("[DEBUG] main_op: Moving from '%s' toward '%s', status='%s'\n",
+                            //         shm->current_floor, shm->destination_floor, shm->status);
                             //Check if we have arrived 
                             if (floor_compare(shm->current_floor, shm->destination_floor) ==0) {
                                 //Destination has been reached and we need to unlock and start the door sequenece
@@ -554,11 +618,17 @@ int main(int argc, char **argv) {
     
     pthread_join(main_thread, NULL);
     pthread_join(ctrl_thread, NULL);
+    if (shm && !cleanup_in_progress) {
+        pthread_mutex_destroy(&shm->mutex);
+        pthread_cond_destroy(&shm->cond);
+    }
     
     // Cleanup
     if (shm) {
-        pthread_mutex_destroy(&shm->mutex);
-        pthread_cond_destroy(&shm->cond);
+        if(!cleanup_in_progress) {
+            pthread_mutex_destroy(&shm->mutex);
+            pthread_cond_destroy(&shm->cond);
+        }
         munmap(shm, sizeof(car_shared_mem));
     }
     if (shm_fd != -1) {

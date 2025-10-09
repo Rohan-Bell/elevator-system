@@ -1,4 +1,5 @@
 #include "shared.h"
+#include <stddef.h>
 
 void recv_looped(int fd, void *buf, size_t sz) {
     char *ptr = buf;
@@ -113,7 +114,38 @@ void int_to_floor(int floor_int, char *floor_str, size_t size) {
     }
 }
 
-// Testing utility
-void msg(const char *s) {
-    printf("%s\n", s);
+// Message and shared mem
+void msg(const char *string)
+{
+  printf("%s\n    ", string);
+  fflush(stdout);
+}
+
+void reset_shm(car_shared_mem *s)
+{
+  pthread_mutex_lock(&s->mutex);
+  size_t offset = offsetof(car_shared_mem, current_floor);
+  memset((char *)s + offset, 0, sizeof(*s) - offset);
+
+  strcpy(s->status, "Closed");
+  strcpy(s->current_floor, "1");
+  strcpy(s->destination_floor, "1");
+  pthread_mutex_unlock(&s->mutex);
+}
+
+void init_shm(car_shared_mem *s)
+{
+  pthread_mutexattr_t mutattr;
+  pthread_mutexattr_init(&mutattr);
+  pthread_mutexattr_setpshared(&mutattr, PTHREAD_PROCESS_SHARED);
+  pthread_mutex_init(&s->mutex, &mutattr);
+  pthread_mutexattr_destroy(&mutattr);
+
+  pthread_condattr_t condattr;
+  pthread_condattr_init(&condattr);
+  pthread_condattr_setpshared(&condattr, PTHREAD_PROCESS_SHARED);
+  pthread_cond_init(&s->cond, &condattr);
+  pthread_condattr_destroy(&condattr);
+
+  reset_shm(s);
 }

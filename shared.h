@@ -40,8 +40,9 @@ int validate_floor(const char* floor);
 int floor_to_int(const char *floor_str);
 void int_to_floor(int floor_int, char *floor_str, size_t size);
 
-void msg(const char *s);
-
+void msg(const char *string);
+void reset_shm(car_shared_mem *s);
+void init_shm(car_shared_mem *s);
 
 
 
