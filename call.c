@@ -21,19 +21,10 @@ int main(int argc, char **argv) {
         printf("Invalid floor(s) specified.\n");
         exit(1);
     }
-
-    // Initialize SSL context
-    SSL_CTX *ssl_ctx = init_ssl_client_context();
-    if (!ssl_ctx) {
-        printf("Unable to initialize SSL.\n");
-        exit(1);
-    }
-
     //Create a socket
     int sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd == -1) {
         printf("Unable to connect to elevator system.\n");
-        SSL_CTX_free(ssl_ctx);
         exit(1);
     }
     //setup the server address
@@ -45,7 +36,6 @@ int main(int argc, char **argv) {
     if (inet_pton(AF_INET, ip_address, &addr.sin_addr) == -1) {
         printf("Unable to connect to elevator system.\n");
         close (sockfd);
-        SSL_CTX_free(ssl_ctx);
         exit(1);
     }
 
@@ -53,54 +43,30 @@ int main(int argc, char **argv) {
     if (connect(sockfd, (const struct sockaddr *)&addr, sizeof(addr)) == -1) {
         printf("Unable to connect to elevator system.\n");
         close(sockfd);
-        SSL_CTX_free(ssl_ctx);
-        exit(1);
-    }
-
-    // Create SSL and connect
-    SSL *ssl = SSL_new(ssl_ctx);
-    if (!ssl) {
-        printf("Unable to create SSL.\n");
-        close(sockfd);
-        SSL_CTX_free(ssl_ctx);
-        exit(1);
-    }
-    SSL_set_fd(ssl, sockfd);
-    if (SSL_connect(ssl) <= 0) {
-        printf("Unable to establish SSL connection.\n");
-        ERR_print_errors_fp(stderr);
-        SSL_free(ssl);
-        close(sockfd);
-        SSL_CTX_free(ssl_ctx);
         exit(1);
     }
 
     //prepare to send CALL message
     char call_message[256];
     snprintf(call_message, sizeof(call_message), "CALL %s %s", source_floor, destination_floor);
-    send_message_ssl(ssl, call_message);
+    send_message(sockfd, call_message);
     
     //Receive the response
-    char *response = receive_msg_ssl(ssl);
+    char *response = receive_msg(sockfd);
 
     //Process the resposne 
-    if(response != NULL && strncmp(response, "CAR ", 4) == 0) {
+    if(strncmp(response, "CAR ", 4) == 0) {
         //print tje server response
         printf("Car %s is arriving.\n", response + 4);
-    } else if(response != NULL && strcmp(response,"UNAVAILABLE") == 0) {
+    } else if(strcmp(response,"UNAVAILABLE") == 0) {
         printf("Sorry, no car is available to take this request.\n");
     } else {
         printf("Unable to connect to elevator system.\n");
     }
-    if (response) free(response); //free the memeory up
-    SSL_free(ssl);
+    free(response); //free the memeory up
     if(close(sockfd) == -1) {
         perror("close()");
-        SSL_CTX_free(ssl_ctx);
         exit(1);
     }
-    SSL_CTX_free(ssl_ctx);
     return 0;
-
-
 }
