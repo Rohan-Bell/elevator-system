@@ -149,10 +149,3 @@ void init_shm(car_shared_mem *s)
 
   reset_shm(s);
 }
-
-// SSL versions
-void send_looped_ssl(SSL *ssl, const void *buf, size_t sz);
-char *receive_msg_ssl(SSL *ssl);
-void send_message_ssl(SSL *ssl, const char *buf);
-SSL_CTX *init_ssl_context(void);
-SSL_CTX *init_ssl_client_context(void);

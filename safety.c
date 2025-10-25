@@ -21,12 +21,12 @@
 *   
     Timing Considerations:
     1. The  safety system must respond immediatly to condition varaible signals. It must ensure minial latency between the detection and the response
-    2. Priority inversion: Although this system isn't using RTOS,  I want to design the system so that it minimizes mutex gold time to reduce any blocking
+    2. Priority inversion: Although this system isn't using RTOS,  I want to design the system so that it minimizes mutex hold time to reduce any blocking
     3. The safety checks must have bounded execution time that does not dynamically allocate or with unbounded loops to ensure deterministic behaviour
 
     Faults:
     1. Any detected unwanted changes to the system must trigger emergency mode. This is the safest possible sate when there is uncertainty in the system. 
-    2. A heartbeat is used through safety_system heartbeat field for a simple watchdog to prevent saferty system failures or communication breakdowmns
+    2. A heartbeat is used through safety_system heartbeat field for a simple watchdog to prevent safety system failures or communication breakdowmns
     3. Data validation must be performed on all shared memory fields to detect corruption, buffer overflow or manipulation
     4. All systems must be redundant and independant thus ensuring that there is no single point of failure
 
@@ -35,9 +35,21 @@
     2. String operations are bounded functions that have checks for length to prevent any buffer overflow
     3. All numeric comparisons must check for a valid range to prevent wrap arounds
 *
-*
-*/
-//Forcing the declaration as part of the POSIX.1-2000 standard for the use of strnlen 
+
+Some of the major deviations that were done and why:
+    1. Used errno-aware conversion because without using dynamic memory we need to parse numeric strings in shared memory.
+    Thus strtol is used to do this but have errno as a check or reset with explicit ranges to detect bad input and overflow.
+    Errno is always set to 0 before teh call and checked straigth after and therefore is an acceptable deviation
+
+    2. There are places taht exit() is used. It is only used when a safety component cannot open or map the required shared memory. 
+    Thus continuing from ehre would be unsafe and exit can be deemed useable. It is only uysed in startup failure paths
+**/
+
+
+/**
+ * Deviation from MISRA C. I am using a Non Standard preprocesser for the use of strnlen and other shared memory functions that I was having issues wioth thee standard
+ * preprocessor. 
+ */
 #define _POSIX_C_SOURCE 200809L
 
 #include <stdlib.h>
@@ -48,11 +60,10 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdint.h>
-#include <signal.h>
 #include <errno.h>
 #include "shared_mem.h"
 
-//Constants that are predefined for saferty critical values
+//Constants that are predefined for safety critical values
 #define SAFETY_SYSTEM_ACTIVE_VALUE 1U
 #define BOOLEAN_TRUE_VALUE 1U
 #define BOOLEAN_FALSE_VALUE 0U
@@ -64,20 +75,12 @@
 #define FILE_PERMISSIONS 438
 #define STDOUT_FD 1
 #define STDERR_FD 2
-#define BASEMENT_MIN_LEVEL 1
-#define BASEMENT_MAX_LEVEL 99
-#define FLOOR_MIN_LEVEL 1
-#define FLOOR_MAX_LEVEL 999
+#define BASEMENT_MIN_LEVEL 1L
+#define BASEMENT_MAX_LEVEL 99L
+#define FLOOR_MIN_LEVEL 1L
+#define FLOOR_MAX_LEVEL 999L
 
 /*Valid status strings for checking*/
-
-static const char* const VALID_STATUSES[] = {
-    "Opening",
-    "Open",
-    "Closing",
-    "Closed",
-    "Between"
-};
 
 #define NUM_VALID_STATUSES 5U
 
@@ -96,17 +99,16 @@ static int check_data_consistency(car_shared_mem* shm);
 static void safe_write(int fd, const char *message); // This is to not use printf
 static int construct_shm_name(char *dest, size_t dest_size, const char *car_name);
 
-int main(int argc, const char * const *argv){
+int main(int argc, char *argv[]){
     if (argc != EXPECTED_ARGC) {
-        safe_write(STDERR_FD, "Invalid Number of Args.\n");
-        //Exit early, this is permissable as this is a critical init failure continuing would be unsafe
+        //Deviation from MISRA C Use of exit() is permissible only in initialization failures where continued operation would be unsafe.
         exit(EXIT_FAILURE);
     }
     const char* car_name = argv[1];
     char shm_name[SHM_NAME_BUFFER_SIZE]; //Build a shared memory object name
     if (construct_shm_name(shm_name, sizeof(shm_name), car_name) != 0) {
         safe_write(STDERR_FD, "Error: Car name is too long or invalid.\n");
-        exit(EXIT_FAILURE);
+        exit(EXIT_FAILURE); // Same as before
     }
 
     //Lets open up the shared memory
@@ -152,21 +154,23 @@ int main(int argc, const char * const *argv){
                 break;
             }
 
-        //handle a heartbeat check to ensure everything is all good
-        handle_safety_system_heartbeat(shm);
+            if (wait_rc == 0) {
+                //handle a heartbeat check to ensure everything is all good
+                handle_safety_system_heartbeat(shm);
 
-        //Ensure that there is no door obstruction
-        handle_door_obstruction(shm);
-        
-        //Check the e stop
-        handle_emergency_stop(shm);
+                //Ensure that there is no door obstruction
+                handle_door_obstruction(shm);
+                
+                //Check the e stop
+                handle_emergency_stop(shm);
 
-        //Check for any overload
-        handle_overload(shm);
+                //Check for any overload
+                handle_overload(shm);
 
-        //Check the data consistency is correct
-            if (check_data_consistency(shm) == 0) {
-                handle_data_consistency_error(shm); /* did not return true -> handle error */
+                //Check the data consistency is correct
+                if (check_data_consistency(shm) == 0) {
+                    handle_data_consistency_error(shm); /* did not return true -> handle error */
+                }
             }
 
             /* Unlock the mutex; ignore unlock return for compatibility with the
@@ -181,7 +185,7 @@ int main(int argc, const char * const *argv){
 //Safety check functions below
 
 static void handle_safety_system_heartbeat(car_shared_mem* shm) {
-    if (shm-> safety_system != SAFETY_SYSTEM_ACTIVE_VALUE) {
+    if (shm->safety_system != SAFETY_SYSTEM_ACTIVE_VALUE) {
             //update the shared memory with the new value
         shm->safety_system = SAFETY_SYSTEM_ACTIVE_VALUE;
         
@@ -191,7 +195,7 @@ static void handle_safety_system_heartbeat(car_shared_mem* shm) {
 static void handle_door_obstruction(car_shared_mem* shm) {
     if ((shm->door_obstruction == BOOLEAN_TRUE_VALUE) && (strcmp(shm->status, "Closing") == 0)) {
         /* Using strncpy for bounded string copy rule 21.6 */
-        strncpy(shm->status, "Opening", sizeof(shm->status) - 1U); /* Something got stuck in door open the door */
+        (void)strncpy(shm->status, "Opening", sizeof(shm->status) - 1U); /* Something got stuck in door open the door */
         shm->status[sizeof(shm->status) - 1U] = '\0'; /* Null-termination is ensured by forcing it. */
     }
 }
@@ -268,7 +272,11 @@ static int validate_floor_string(const char* floor) {
     if (floor == NULL) {
         result = 0;
     } else {
-        size_t len = strnlen(floor, MAX_FLOOR_STRING_LENGTH + 2U); /* Check against a slightly larger value to detect overflow */
+        /* Manual length check to replace strnlen */
+        size_t len = 0;
+        while ((len < (MAX_FLOOR_STRING_LENGTH + 2U)) && (floor[len] != '\0')) {
+            len++;
+        }
         if((len == 0U) || (len > MAX_FLOOR_STRING_LENGTH)) {
             result = 0; /* Improper floor size. */
         } else {
@@ -281,11 +289,15 @@ static int validate_floor_string(const char* floor) {
                 } else {
                     errno = 0; /* Reset errno before the call */
                     converted_num = strtol(&floor[1], &endptr, 10);
-                    /* Check for conversion errors (4.7) */
+                    /* Deviation from MISRA C errno is tested immediately after strtol (an errno-setting function) in a thread-safe manner for safety-critical validation. */
                     if ((endptr == &floor[1]) || (*endptr != '\0') || (errno == ERANGE)) {
                         result = 0; /* Not a valid number or out of range */
                     } else {
-                        result = ((converted_num >= BASEMENT_MIN_LEVEL) && (converted_num <= BASEMENT_MAX_LEVEL)) ? 1 : 0;
+                        if ((converted_num >= BASEMENT_MIN_LEVEL) && (converted_num <= BASEMENT_MAX_LEVEL)) {
+                            result = 1;
+                        } else {
+                            result = 0;
+                        }
                     }
                 }
             } else {
@@ -293,11 +305,15 @@ static int validate_floor_string(const char* floor) {
                 errno = 0; /* Reset errno before the call */
                 converted_num = strtol(floor, &endptr, 10);
 
-                /* Check for conversion errors */
+                /* Deviation from MISRA C errno is tested immediately after strtol (an errno-setting function) in a thread-safe manner for safety-critical validation. */
                 if ((endptr == floor) || (*endptr != '\0') || (errno == ERANGE)) {
                     result = 0; /* Not a valid number or out of range */
                 } else {
-                    result = ((converted_num >= FLOOR_MIN_LEVEL) && (converted_num <= FLOOR_MAX_LEVEL)) ? 1 : 0;
+                    if ((converted_num >= FLOOR_MIN_LEVEL) && (converted_num <= FLOOR_MAX_LEVEL)) {
+                        result = 1;
+                    } else {
+                        result = 0;
+                    }
                 }
             }
         }
@@ -307,6 +323,14 @@ static int validate_floor_string(const char* floor) {
 }
 
 static int validate_status_string(const char* status) {
+    static const char* const VALID_STATUSES[] = {
+        "Opening",
+        "Open",
+        "Closing",
+        "Closed",
+        "Between"
+    };
+
     int result = 0;
 
     if (status == NULL) {
@@ -327,6 +351,10 @@ static int validate_status_string(const char* status) {
 static int check_boolean_field(uint8_t field_value) {
     return (field_value < 2U) ? 1 : 0; //Is it true or false? 1 or 0?
 }
+
+/// @brief Uses Write() instead of prinntf() and flush to be MISRA compliant.
+/// @param fd File descriptor
+/// @param message Message that needs to be written to terminal
 static void safe_write(int fd, const char *message) {
     /* Capture the return value to satisfy MISRA rationale for checking
        functions that can fail; value intentionally discarded after assign. */
@@ -334,18 +362,13 @@ static void safe_write(int fd, const char *message) {
     (void)r;
 }
 
-/**
- * @brief Safely constructs the shared memory object name.
- *
- * This function is a MISRA-compliant replacement for snprintf for the specific
- * task of creating a name like "/car<name>". It performs explicit bounds
- * checking to prevent buffer overflows.
- *
- * @param dest The destination buffer to write the name into.
- * @param dest_size The total size of the destination buffer.
- * @param car_name The name of the car to append.
- * @return 0 on success, -1 on failure (e.g., buffer too small).
- */
+
+
+/// @brief Constructs the shared memory name safetly. It uses a MISRA-Compliant replacnement for snprintf and creates a name like ".car<name>"
+/// @param dest The destination buffer to write the name into.
+/// @param dest_size The total size of the destination buffer.
+/// @param car_name The name of the car to append.
+/// @return 0 on success, -1 on failure 
 static int construct_shm_name(char *dest, size_t dest_size, const char *car_name) {
     int result = 0;
 
@@ -355,13 +378,17 @@ static int construct_shm_name(char *dest, size_t dest_size, const char *car_name
 
     /* Safety Check 1: Ensure the combined length fits in the buffer.
        We need space for the prefix, the name, and the null terminator ('\0'). */
-    if ((prefix_len + car_name_len + 1) > dest_size) {
+    if ((prefix_len + car_name_len + 1U) > dest_size) {
         result = -1; /* Failure: Buffer is too small. */
     } else {
-        /* If checks pass, it is now safe to copy the strings. */
-        (void)memcpy(dest, prefix, prefix_len);
-        (void)memcpy(dest + prefix_len, car_name, car_name_len);
-
+        /* If checks pass, it is now safe to copy the strings using manual loops to avoid memcpy */
+        size_t i;
+        for (i = 0; i < prefix_len; i++) {
+            dest[i] = prefix[i];
+        }
+        for (i = 0; i < car_name_len; i++) {
+            dest[prefix_len + i] = car_name[i];
+        }
         /* Manually add the null terminator. */
         dest[prefix_len + car_name_len] = '\0';
 
