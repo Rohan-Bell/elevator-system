@@ -49,19 +49,19 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <signal.h>
-#include "shared_mem.h"
 #include <errno.h>
+#include "shared_mem.h"
 
 //Constants that are predefined for saferty critical values
 #define SAFETY_SYSTEM_ACTIVE_VALUE 1U
 #define BOOLEAN_TRUE_VALUE 1U
 #define BOOLEAN_FALSE_VALUE 0U
 #define MAX_FLOOR_STRING_LENGTH 3U
-#define MAX_STATUS_STRING_LENGTHJ 7U
+#define MAX_STATUS_STRING_LENGTH 7U
 
 #define EXPECTED_ARGC 2
 #define SHM_NAME_BUFFER_SIZE 256
-#define FILE_PERMISSIONS 0666
+#define FILE_PERMISSIONS 438
 #define STDOUT_FD 1
 #define STDERR_FD 2
 #define BASEMENT_MIN_LEVEL 1
@@ -96,7 +96,7 @@ static int check_data_consistency(car_shared_mem* shm);
 static void safe_write(int fd, const char *message); // This is to not use printf
 static int construct_shm_name(char *dest, size_t dest_size, const char *car_name);
 
-int main(int argc, char **argv){
+int main(int argc, const char * const *argv){
     if (argc != EXPECTED_ARGC) {
         safe_write(STDERR_FD, "Invalid Number of Args.\n");
         //Exit early, this is permissable as this is a critical init failure continuing would be unsafe
@@ -127,9 +127,30 @@ int main(int argc, char **argv){
 
     //Now we have mapped the memory and everything is setup. Can now enter safety monitoring loop
     while(1) {
-        (void)pthread_mutex_lock(&shm->mutex); //lock down the mutex so can only access when we want,
-        //Now we want to wait for a change in the shared memory
-        (void)pthread_cond_wait(&shm->cond, &shm->mutex); //Dooing this way elimintates risk of change between polling
+            /* Acquire the mutex and check return code. If lock fails, escalate to
+               emergency mode and retry after a short sleep to avoid spinning. */
+            int rc = pthread_mutex_lock(&shm->mutex);
+            if (rc != 0) {
+                safe_write(STDERR_FD, "Mutex lock failed in safety system.\n");
+                put_car_in_emergency_mode(shm);
+                /* Back off briefly to avoid tight loop */
+                (void)sleep(1);
+                continue;
+            }
+
+            /* Wait for a change in shared memory. Handle interrupts (EINTR) by
+               retrying; any other error escalates to emergency mode. */
+            int wait_rc = pthread_cond_wait(&shm->cond, &shm->mutex);
+            while (wait_rc != 0) {
+                if (wait_rc == EINTR) {
+                    /* Interrupted by a signal, retry waiting */
+                    wait_rc = pthread_cond_wait(&shm->cond, &shm->mutex);
+                    continue;
+                }
+                safe_write(STDERR_FD, "Condition wait failed in safety system.\n");
+                put_car_in_emergency_mode(shm);
+                break;
+            }
 
         //handle a heartbeat check to ensure everything is all good
         handle_safety_system_heartbeat(shm);
@@ -144,10 +165,13 @@ int main(int argc, char **argv){
         handle_overload(shm);
 
         //Check the data consistency is correct
-        if(check_data_consistency(shm) == 0) {
-            handle_data_consistency_error(shm); // did not return true handle errro
-        }
-        pthread_mutex_unlock(&shm->mutex); // All checks have passed unlock the mutex bbefore repeating
+            if (check_data_consistency(shm) == 0) {
+                handle_data_consistency_error(shm); /* did not return true -> handle error */
+            }
+
+            /* Unlock the mutex; ignore unlock return for compatibility with the
+               rest of the code, but call is performed. */
+            (void)pthread_mutex_unlock(&shm->mutex);
     }
     //The code should never reach here. But just in case unmap the memory and return
     (void)munmap(shm, sizeof(car_shared_mem));
@@ -166,9 +190,9 @@ static void handle_safety_system_heartbeat(car_shared_mem* shm) {
 
 static void handle_door_obstruction(car_shared_mem* shm) {
     if ((shm->door_obstruction == BOOLEAN_TRUE_VALUE) && (strcmp(shm->status, "Closing") == 0)) {
-        //Using strncpy for bounded string copy rule 21.6
-        strncpy(shm->status, "Opening", sizeof(shm->status)-1); // Something got stuck in door open the door
-        shm->status[sizeof(shm->status) -1] = '\0'; //Null-termination is ensured by forcing it.
+        /* Using strncpy for bounded string copy rule 21.6 */
+        strncpy(shm->status, "Opening", sizeof(shm->status) - 1U); /* Something got stuck in door open the door */
+        shm->status[sizeof(shm->status) - 1U] = '\0'; /* Null-termination is ensured by forcing it. */
     }
 }
 
@@ -198,76 +222,116 @@ static void put_car_in_emergency_mode(car_shared_mem* shm) {
 }
 
 static int check_data_consistency(car_shared_mem* shm) {
-    /* Skip the data check if in emergency mode as data cannot break anyhting*/
-    if(shm->emergency_mode == BOOLEAN_TRUE_VALUE) return 1; //Check passed
-    
-    //Check floor strings
-    if(validate_floor_string(shm->current_floor) == 0) return 0; //Failed
-    if(validate_floor_string(shm->destination_floor) == 0) return 0; //Failed
+    int result = 1; /* Assume success */
 
-    //check status stirng
-    if(validate_status_string(shm->status) == 0) return 0; //failed
-
-    //check the boolean fields for values >=- 2
-    if(check_boolean_field(shm->open_button) == 0) return 0;
-    if(check_boolean_field(shm->close_button) == 0) return 0;
-    if(check_boolean_field(shm->door_obstruction) == 0) return 0;
-    if(check_boolean_field(shm->overload) == 0) return 0;
-    if(check_boolean_field(shm->emergency_stop) == 0) return 0;
-    if(check_boolean_field(shm->individual_service_mode) == 0) return 0;
-    if(check_boolean_field(shm->emergency_mode) == 0) return 0;
-
-    //check the door obstructuon logic
-    if(shm->door_obstruction == BOOLEAN_TRUE_VALUE) {
-        if ((strcmp(shm->status, "Opening") != 0) && (strcmp(shm->status, "Closing") != 0)) return 0;
+    /* Skip the data check if in emergency mode as data cannot break anything*/
+    if(shm->emergency_mode == BOOLEAN_TRUE_VALUE) {
+        result = 1; /* Check passed */
+    } else {
+        /* Check floor strings */
+        if(validate_floor_string(shm->current_floor) == 0) {
+            result = 0; /* Failed */
+        } else if(validate_floor_string(shm->destination_floor) == 0) {
+            result = 0; /* Failed */
+        } else if(validate_status_string(shm->status) == 0) {
+            result = 0; /* Failed */
+        } else if(check_boolean_field(shm->open_button) == 0) {
+            result = 0;
+        } else if(check_boolean_field(shm->close_button) == 0) {
+            result = 0;
+        } else if(check_boolean_field(shm->door_obstruction) == 0) {
+            result = 0;
+        } else if(check_boolean_field(shm->overload) == 0) {
+            result = 0;
+        } else if(check_boolean_field(shm->emergency_stop) == 0) {
+            result = 0;
+        } else if(check_boolean_field(shm->individual_service_mode) == 0) {
+            result = 0;
+        } else if(check_boolean_field(shm->emergency_mode) == 0) {
+            result = 0;
+        } else {
+            /* Check the door obstruction logic */
+            if(shm->door_obstruction == BOOLEAN_TRUE_VALUE) {
+                if ((strcmp(shm->status, "Opening") != 0) && (strcmp(shm->status, "Closing") != 0)) {
+                    result = 0;
+                }
+            }
+        }
     }
-    //All checks have passed return true
-    return 1;
+
+    return result;
 }
 
 static int validate_floor_string(const char* floor) {
-    size_t len = strnlen(floor, MAX_FLOOR_STRING_LENGTH + 2); // Check against a slightly larger value to detect overflow
-    if(len == 0U || len > MAX_FLOOR_STRING_LENGTH) return 0; //Improper floor size.
-    long converted_num;
-    char *endptr;
-    if(floor[0] == 'B') {
-        //It is a basement floor 
-        if(len < 2U) return 0; // check character sizing
-        errno = 0; // Reset errno before the call
-        converted_num = strtol(floor + 1, &endptr, 10);
-        // Check for conversion errors (4.7)
-        if (endptr == (floor + 1) || *endptr != '\0' || errno == ERANGE) {
-            return 0; // Not a valid number or out of range
-        }
-        return (converted_num >= BASEMENT_MIN_LEVEL && converted_num <= BASEMENT_MAX_LEVEL) ? 1 : 0;
-    } else {
-        //regular floor
-        errno = 0; // Reset errno before the call
-        converted_num = strtol(floor, &endptr, 10);
+    int result = 0;
 
-        // Check for conversion errors
-        if (endptr == floor || *endptr != '\0' || errno == ERANGE) {
-            return 0; // Not a valid number or out of range
+    if (floor == NULL) {
+        result = 0;
+    } else {
+        size_t len = strnlen(floor, MAX_FLOOR_STRING_LENGTH + 2U); /* Check against a slightly larger value to detect overflow */
+        if((len == 0U) || (len > MAX_FLOOR_STRING_LENGTH)) {
+            result = 0; /* Improper floor size. */
+        } else {
+            long converted_num;
+            char *endptr;
+            if(floor[0] == 'B') {
+                /* It is a basement floor */
+                if(len < 2U) {
+                    result = 0; /* check character sizing */
+                } else {
+                    errno = 0; /* Reset errno before the call */
+                    converted_num = strtol(&floor[1], &endptr, 10);
+                    /* Check for conversion errors (4.7) */
+                    if ((endptr == &floor[1]) || (*endptr != '\0') || (errno == ERANGE)) {
+                        result = 0; /* Not a valid number or out of range */
+                    } else {
+                        result = ((converted_num >= BASEMENT_MIN_LEVEL) && (converted_num <= BASEMENT_MAX_LEVEL)) ? 1 : 0;
+                    }
+                }
+            } else {
+                /* regular floor */
+                errno = 0; /* Reset errno before the call */
+                converted_num = strtol(floor, &endptr, 10);
+
+                /* Check for conversion errors */
+                if ((endptr == floor) || (*endptr != '\0') || (errno == ERANGE)) {
+                    result = 0; /* Not a valid number or out of range */
+                } else {
+                    result = ((converted_num >= FLOOR_MIN_LEVEL) && (converted_num <= FLOOR_MAX_LEVEL)) ? 1 : 0;
+                }
+            }
         }
-        return (converted_num >= FLOOR_MIN_LEVEL && converted_num <= FLOOR_MAX_LEVEL) ? 1 : 0;
     }
+
+    return result;
 }
 
 static int validate_status_string(const char* status) {
-    if (status == NULL) return 0;
-    for (size_t i = 0U; i < NUM_VALID_STATUSES; i++) {
-        if (strcmp(status, VALID_STATUSES[i]) == 0) {
-            return 1; //The status is a valid satus
+    int result = 0;
+
+    if (status == NULL) {
+        result = 0;
+    } else {
+        result = 0; /* Assume invalid */
+        for (size_t i = 0U; i < NUM_VALID_STATUSES; i++) {
+            if (strcmp(status, VALID_STATUSES[i]) == 0) {
+                result = 1; /* The status is a valid status */
+                break;
+            }
         }
     }
-    return 0; //an invalid status
+
+    return result;
 }
 
 static int check_boolean_field(uint8_t field_value) {
     return (field_value < 2U) ? 1 : 0; //Is it true or false? 1 or 0?
 }
 static void safe_write(int fd, const char *message) {
-    (void)write(fd, message, strlen(message));
+    /* Capture the return value to satisfy MISRA rationale for checking
+       functions that can fail; value intentionally discarded after assign. */
+    ssize_t r = write(fd, message, strlen(message));
+    (void)r;
 }
 
 /**
@@ -283,22 +347,26 @@ static void safe_write(int fd, const char *message) {
  * @return 0 on success, -1 on failure (e.g., buffer too small).
  */
 static int construct_shm_name(char *dest, size_t dest_size, const char *car_name) {
+    int result = 0;
+
     const char *prefix = "/car";
     size_t prefix_len = strlen(prefix);
     size_t car_name_len = strlen(car_name);
 
-    // Safety Check 1: Ensure the combined length fits in the buffer.
-    // We need space for the prefix, the name, and the null terminator ('\0').
+    /* Safety Check 1: Ensure the combined length fits in the buffer.
+       We need space for the prefix, the name, and the null terminator ('\0'). */
     if ((prefix_len + car_name_len + 1) > dest_size) {
-        return -1; // Failure: Buffer is too small.
+        result = -1; /* Failure: Buffer is too small. */
+    } else {
+        /* If checks pass, it is now safe to copy the strings. */
+        (void)memcpy(dest, prefix, prefix_len);
+        (void)memcpy(dest + prefix_len, car_name, car_name_len);
+
+        /* Manually add the null terminator. */
+        dest[prefix_len + car_name_len] = '\0';
+
+        result = 0; /* Success */
     }
 
-    // If checks pass, it is now safe to copy the strings.
-    memcpy(dest, prefix, prefix_len);
-    memcpy(dest + prefix_len, car_name, car_name_len);
-
-    // Manually add the null terminator.
-    dest[prefix_len + car_name_len] = '\0';
-
-    return 0; // Success
+    return result;
 }

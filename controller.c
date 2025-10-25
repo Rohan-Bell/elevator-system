@@ -1,62 +1,46 @@
 /**
  * Elevator System Controller
+ *
+ * The controller module accepts connections from elevator cars and
+ * call pads. A Static pool of car state entries and a static pool for 
+ * client handler arguments  are used to avoid unbounded resources or issues 
+ * with race conditions. This design is not fully MISRA C Compliant but is designed
+ * to be robust.
+ *
+ * What I tried to do: 
  * 
- * The controller is not the designated safety-critical component but 
- * it is still smart to use the safety critical mindset. 
- * 
- * Throughout the following code the following considerations will be met:
- * 
- *  1. No dynamic memory allocation
- *          There will be no use of malloc() and free() and all data structs
- *          should be a fixed size static array ensuring no memory leaks,
- *          heap fragmentation or non-deterministic allocation times. 
- *          The max number of cars and queue depth are compile-time constants.
- * 
- *  2. Strict error checking and resource management 
- *          The return value of every system call that can fail is checked.
- *          This includes socket, accept, bind, read, and write operations.
- *          If failed, errors are logged and the program goes to a safe state
- *          and ensures that file descriptors are closed properly.
- * 
- *  3. Concurrency and race conditions
- *          All shared data (the cars array) is protected by a single 
- *          'pthread_mutex_t' where the mutex is locked before any 
- *          read or write actions and then immediately unlocked after.
- *          The lock is held to ensure that car states are prevented from
- *          changing while scheduling decisions are being made.
- * 
- *  4. Asynchronous signal handling
- *          To handle termination via CTRL+C (SIGINT), a safe handler is used.
- *          The handler sets a volatile 'sig_atomic_t' flag true. The main loop
- *          checks this flag and performs a graceful shutdown by closing the 
- *          listening socket and allowing the program to terminate cleanly. 
- *          SIGPIPE is ignored to prevent the program crashing on write to 
- *          closed sockets.
- * 
- *  5. Justified decision of using snprintf 
- *          While the MISRA C standards discourage the <stdio.h> functions,
- *          they are being used to create log messages. These should be replaced 
- *          with a write function in a true safety critical system. But for the 
- *          goal of the logs here, this would make the code very messy. 
- *          snprintf is a safe choice for composing messages in a bounded buffer.
- *          This is deemed as an acceptable change with justification.
- * 
- *  6. Elevator scheduling algorithm
- *          The controller implements an intelligent scheduling algorithm that:
- *          - Finds the best car for each request based on pickup cost
- *          - Inserts new requests optimally to minimize direction changes
- *          - Handles direction extension (continuing past existing stops)
- *          - Prevents duplicate floor entries in the queue
- *          - Supports INDIVIDUAL SERVICE and EMERGENCY modes
- * 
- * All controller tests (1-4) pass with 100% consistency:
- *  - Test 1: Basic controller operations and scheduling
- *  - Test 2: Multiple cars and optimal car selection
- *  - Test 3: Individual service and emergency mode handling
- *  - Test 4: Complex routing optimization with direction changes
+ * 1. Minimize dynamic allocation
+ *    The implementation uses fixed-size static arrays for car state and
+ *    handler argument pools to bound memory usage.
+ *
+ * 2. Strict error checking and resource management
+ *    Socket and thread-related calls are checked. On errors the code
+ *    logs messages and attempts a safe/fail-close of file descriptors.
+ *
+ * 3. Concurrency and race conditions
+ *    Shared state (cars[] and thread_args[]) is protected using
+ *    separate mutexes. This was essential for race conditions
+ *
+ * 4. Signal handling
+ *    SIGPIPE is ignored to avoid crashing on writes to closed sockets.
+ *    SIGINT is handled by setting a volatile sig_atomic_t flag which
+ *    the main loop polls for graceful shutdown.
+ *
+ * 5. Logging and snprintf
+ *    The code uses snprintf to compose bounded log and protocol messages
+ *    for convenience. In stricter safety contexts these should be
+ *    replaced with lower-level, audited output routines.
+ *
+ * 6. Scheduling algorithm
+ *    The controller computes an insertion point for incoming calls and
+ *    assigns calls to the best car based on a pickup index heuristic and
+ *    resulting queue length. The algorithm attempts to avoid unnecessary
+ *    reversals and duplicate queue entries.
  */
 
 #include "shared.h"
+#include <signal.h>
+#include <pthread.h>
 
 #define MAX_CARS 10
 #define MAX_CLIENTS (MAX_CARS + 20) // Cars + some call pads
@@ -105,7 +89,7 @@ static pthread_mutex_t thread_args_mutex = PTHREAD_MUTEX_INITIALIZER;
 //status flag for graceful shutdown
 static volatile sig_atomic_t shutdown_requested = 0;
 
-//Funciton prototypes
+//Function prototypes
 void *client_handler_thread(void *arg);
 void handle_car_connection(int client_fd, const char* initial_message);
 void handle_call_connection(int client_fd, const char* initial_message);
@@ -151,7 +135,7 @@ int main() {
         return EXIT_FAILURE;
     }
 
-    //Bind a sockeet to a port 
+    //Bind a socket to a port 
     memset(&serv_addr, 0 , sizeof(serv_addr));
     serv_addr.sin_family = AF_INET; // Keep in mind ipv4 not ipv6
     serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -176,7 +160,7 @@ int main() {
     while (!shutdown_requested){
         client_fd = accept(listen_fd, NULL, NULL);
         if(client_fd < 0) {
-            if(errno == EINTR) continue; //Was interruped by signal handler
+            if(errno == EINTR) continue; //Was interrupted by signal handler
             perror("accept() failed");
             break; //Exit the loop on other errors
         }
@@ -193,7 +177,7 @@ int main() {
         pthread_mutex_unlock(&thread_args_mutex);
 
         if (arg_idx!= -1) {
-            //Pass thje indexinto static pool as arg
+            //Pass the index into static pool as arg
             if (pthread_create(&threads[arg_idx], NULL, client_handler_thread, 
             (void *)(intptr_t)arg_idx) != 0) {
                 perror("pthread_create() failed");
@@ -206,7 +190,7 @@ int main() {
                 pthread_detach(threads[arg_idx]);
             }
         } else {
-            printf("Max clients readchyed. rejecting new connection.\n");
+            printf("Max clients reached. rejecting new connection.\n");
             close(client_fd);
         }
     }
@@ -219,7 +203,7 @@ int main() {
 }
 
 /**
- * @brief handles a signle client connection it it's own thread
+ * @brief handles a single client connection in its own thread
  */
 void *client_handler_thread(void *arg) {
     int arg_idx = (intptr_t)arg;
@@ -228,7 +212,7 @@ void *client_handler_thread(void *arg) {
     char *buffer = receive_msg(client_fd);
 
     if (buffer == NULL) {
-        //Client has disconnected befdore sending anything
+        //Client has disconnected before sending anything
         close(client_fd);
     } else if (strncmp(buffer, "CAR", 3) == 0) {
         handle_car_connection(client_fd, buffer);
@@ -250,7 +234,7 @@ void handle_car_connection(int client_fd, const char* initial_message) {
     char car_name[BUFFER_SIZE];
     int min_floor, max_floor;
 
-    //The initial "CAR.." ;line is consumed, get the next line
+    //The initial "CAR.." line is consumed, get the next line
 
     if(parse_car_info(initial_message, car_name, &min_floor, &max_floor) != 0) {
         printf("Failed to parse car info.\n");
@@ -272,7 +256,7 @@ void handle_car_connection(int client_fd, const char* initial_message) {
         close(client_fd);
         return;
     }
-    //car is good to go. Lets register the new car
+    //car is good to go. Let's register the new car
     Car *car  = &cars[car_idx];
     car->in_use = 1;
     car->socket_fd = client_fd;
@@ -280,15 +264,15 @@ void handle_car_connection(int client_fd, const char* initial_message) {
     car->floor_min = min_floor;
     car->floor_max = max_floor;
     car-> queue_size = 0;
-    //Initial status is unkwon until the first update
+    //Initial status is unknown until the first update
     strcpy(car->status, "Unknown");
     car->current_floor = min_floor;
 
-    //Finished handlign the data lets unloick the mutex
+    //Finished handling the data; unlock the mutex
     pthread_mutex_unlock(&cars_mutex);
-    printf("Car %s regisered (Floors %d to %d).\n", car_name, min_floor, max_floor);
+    printf("Car %s registered (Floors %d to %d).\n", car_name, min_floor, max_floor);
 
-    //Loop for a status update
+    //Loop for status updates
     while(1) {
         char* msg_buffer = receive_msg(client_fd);
         if (msg_buffer == NULL) break;
@@ -303,7 +287,7 @@ void handle_car_connection(int client_fd, const char* initial_message) {
         int floor;
         char status_buf[BUFFER_SIZE];
         if(parse_status_info(msg_buffer, &floor, status_buf) == 0) {
-            //altering the car so lock the mutex
+            //Altering the car state; lock the cars mutex
             pthread_mutex_lock(&cars_mutex);
             car->current_floor = floor;
             strncpy(car->status, status_buf, sizeof(car->status) -1);
@@ -329,13 +313,13 @@ void handle_car_connection(int client_fd, const char* initial_message) {
 }
 
 /**
- * @brief Handles a transient connection froma a call pad
+ * @brief Handles a transient connection from a call pad
  */
 void handle_call_connection(int client_fd, const char* call_message){
     int source_floor, dest_floor;
 
     if(call_message == NULL || parse_call_info(call_message, &source_floor, &dest_floor) != 0) {
-        printf("Faield to parse call info.\n");
+        printf("Failed to parse call info.\n");
         return;
     }
 
@@ -344,12 +328,12 @@ void handle_call_connection(int client_fd, const char* call_message){
 }
 
 /**
- * @brief sets up signal handler for graceful shutdwon as outlined by the task
+ * @brief Set up signal handlers for graceful shutdown as outlined by the task
  * (SIGINT), also for pipe errors (SIGPIPE)
  */
 
  void setup_signal_handlers(void) {
-    //Ignore teh SIGPIPE to rpevent crashing on write to closed socket
+    //Ignore the SIGPIPE to prevent crashing on write to closed socket
     signal(SIGPIPE, SIG_IGN);
 
     //Setup SIGINT (CTRL+C) handler
@@ -362,7 +346,7 @@ void handle_call_connection(int client_fd, const char* call_message){
 
 
  /**
-  * @brief Async-signal safge handle for SIGINT
+  * @brief Async-signal safe handler for SIGINT
   */
 void sigint_handler(int signum) {
     (void)signum;
@@ -383,11 +367,11 @@ void sigint_handler(int signum) {
     int best_car_idx = -1;
     int min_cost = 1000;
     int best_final_len = 1000;
-    //Lock the mutex as we found the best, so no one can cahnge it 
+    //Lock the mutex as we find the best, so no one can change it 
     pthread_mutex_lock(&cars_mutex);
     for (int i = 0; i < MAX_CARS; i++) {
         if (!cars[i].in_use) continue; 
-        //Elevator car must eb able to service both the floor as a rule
+        //Elevator car must be able to service both floors as a rule
         if (source_floor < cars[i].floor_min || source_floor > cars[i].floor_max
             || dest_floor < cars[i].floor_min || dest_floor > cars[i].floor_max) {
                 continue;
@@ -396,15 +380,15 @@ void sigint_handler(int signum) {
         int cost = calculate_insertion_cost(&cars[i], source_floor, dest_floor,
         &pickup_idx, &final_len);
 
-        if (cost < 0) continue; //An invalid insertion do not consider
+        if (cost < 0) continue; //An invalid insertion, do not consider
 
         /*
         Using the lowest cost by finding the earliest pickup index. If two
         have the same it is the shorter final queue length as a tiebreaker.
-        costr is defined as the idnex of the pickup floor a lower index means the passanger
-        will be picked up sooner realtive to the car's current plan. This heautristic 
-        directly prioritizes passenger wait time for the new call. It is also a balanced apporach
-        taht isn't computationally inexpensive 
+        Cost is defined as the index of the pickup floor. A lower index means the
+        passenger will be picked up sooner relative to the car's current plan. This heuristic 
+        directly prioritizes passenger wait time for the new call. It is also a balanced approach
+        that isn't computationally inexpensive 
         */
 
         if (cost < min_cost || (cost == min_cost && final_len < best_final_len)) {
@@ -418,7 +402,7 @@ void sigint_handler(int signum) {
         Car *chosen_car = &cars[best_car_idx];
         int old_head = (chosen_car->queue_size > 0) ? chosen_car->queue[0] : -1000;
 
-        //recalc the best insertion to get final queue state
+        //Recompute the best insertion to get final queue state
         int pickup_idx, final_len;
         calculate_insertion_cost(chosen_car, source_floor, dest_floor, &pickup_idx, &final_len);
         int temp_queue[MAX_QUEUE_DEPTH];
@@ -446,7 +430,7 @@ void sigint_handler(int signum) {
                         dest_idx = i;
                         break;
                     }
-                } else { // directioon down
+                } else { // direction down
                     if (dest_floor > temp_queue[i]) {
                         dest_idx = i;
                         break;
@@ -469,7 +453,7 @@ void sigint_handler(int signum) {
         printf("Assigned call (%d->%d) to Car %s. New queue size: %d\n",
         source_floor, dest_floor, chosen_car->car_name, chosen_car->queue_size);
 
-        //If the ehad of the queue has changed send a new destination
+        //If the head of the queue has changed send a new destination
         if (chosen_car->queue[0] != old_head) {
             send_next_destination(chosen_car);
         }
@@ -484,7 +468,7 @@ void sigint_handler(int signum) {
 
 
  /**
-  * @brief Calculates the cost of inserting a new request into a cars's queue.
+  * @brief Calculates the cost of inserting a new request into a car's queue.
   * @return the index of the pickup floor (cost) or -1 if impossible
   */
  int calculate_insertion_cost(const Car *car, int source, int dest, int *pickup_idx, int *final_len) {
@@ -496,19 +480,19 @@ void sigint_handler(int signum) {
         }
     }
     Direction request_dir = (dest > source) ? DIR_UP : DIR_DOWN; // is it up or down
-    //Insert as early as possiblew
+    //Insert as early as possible
     int current = effective_floor;
     for(int i = 0; i <= car->queue_size; i++) {
         int next = (i < car->queue_size) ? car->queue[i] : current;// if at end stay
 
         Direction segment_dir = (next > current) ? DIR_UP : ((next < current) ? DIR_DOWN : DIR_IDLE);
-        //Condition can we pick up on thsi segment. We are moving in same direction as request
-        // the source floor is between opur current and next stop
+        //Can we pick up on this segment? We are moving in same direction as request
+        // the source floor is between our current and next stop
 
         if (segment_dir == request_dir) {
             if((request_dir == DIR_UP && source >= current && source < next) ||
             (request_dir == DIR_DOWN && source <= current && source > next)) {
-                //found a valid ickup point. now can we drop off without reversing
+                //found a valid pickup point. now can we drop off without reversing
                 for(int j = i; j <= car->queue_size; j++) {
                     int check_next = (j < car->queue_size) ? car->queue[j] : dest;
                     // Check for direction reversal before drop-off
@@ -532,7 +516,7 @@ void sigint_handler(int signum) {
         }
         
         // Check if we can extend the current direction run
-        // e.g., queue is [6,7,4] going UP then DOWN, and source=8 is beyond 7 in UP direction
+        // For example, queue is [6,7,4] going UP then DOWN, and source=8 is beyond 7 in UP direction
         if (segment_dir != DIR_IDLE && i < car->queue_size) {
             int next_segment_floor = (i + 1 < car->queue_size) ? car->queue[i + 1] : -1;
             Direction next_segment_dir = DIR_IDLE;
@@ -579,20 +563,20 @@ void sigint_handler(int signum) {
         next_segment:
             current = next;
     }
-    //If we couldn't insert it on the way, add it to the end. The csot is higher,
-    //which means it is waiting for jobs to finish
+    //If no suitable insertion was found, append at end.
+    //The cost is higher, which means it is waiting for jobs to finish
     *pickup_idx = car->queue_size;
     *final_len = car->queue_size +2;
     return *pickup_idx;
  }
 
  /**
-  * Queue maangement
+  * Queue management
   */
 
   void insert_into_queue(int *queue, int *size, int index, int value) {
     if (*size >= MAX_QUEUE_DEPTH || index > *size) return;
-    //Don't add if already the last iutenm or dupliate of the nex prev item
+    //Don't add duplicates: if value equals the previous entry, skip
     if (index > 0 && queue[index-1] == value) return;
 
     memmove(&queue[index + 1 ], & queue[index], (*size - index) * sizeof(int));
@@ -610,7 +594,7 @@ void sigint_handler(int signum) {
     if (car->queue_size > 0) {
         char msg[BUFFER_SIZE];
         snprintf(msg, sizeof(msg), "FLOOR %d", car->queue[0]);
-        send_message(car->socket_fd,msg);
+        send_message(car->socket_fd, msg);
     }
   }
 
