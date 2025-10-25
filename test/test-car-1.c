@@ -1,6 +1,4 @@
-#define _POSIX_C_SOURCE 199309L
 #include "shared.h"
-#include <time.h>
 
 // Tester for car (Shared memory, delay and door operation, no controller)
 
@@ -105,8 +103,6 @@ void cleanup(pid_t p)
 
 void displaycond(car_shared_mem *s)
 {
-  struct timespec now;
-  clock_gettime(CLOCK_MONOTONIC, &now);
   pthread_mutex_lock(&s->mutex);
   printf("Current state: {%s, %s, %s, %d, %d, %d, %d, %d, %d, %d}\n",
     s->current_floor,

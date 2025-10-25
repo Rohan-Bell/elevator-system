@@ -4,9 +4,9 @@
 
 #define DELAY 50000 // 50ms
 
-void displaycond(car_shared_mem *shm);
+void displaycond(car_shared_mem *);
 int safety(void);
-void cleanup(pid_t pid);
+void cleanup(pid_t p);
 
 int main()
 {
@@ -18,7 +18,7 @@ int main()
   msg("Unable to access car Test.");
   system("./safety Test"); // Attempt to launch safety system with shm missing
 
-  int fd = shm_open("/carTest", O_CREAT | O_RDWR, 438);
+  int fd = shm_open("/carTest", O_CREAT | O_RDWR, 0666);
   ftruncate(fd, sizeof(car_shared_mem));
   car_shared_mem *shm = mmap(0, sizeof(*shm), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
   init_shm(shm);
@@ -136,7 +136,7 @@ int main()
 
   msg("Data consistency error!");
   pthread_mutex_lock(&shm->mutex);
-  shm->emergency_stop = 241U;
+  shm->emergency_stop = 241;
   pthread_mutex_unlock(&shm->mutex);
   pthread_cond_broadcast(&shm->cond);
   usleep(DELAY);
@@ -176,7 +176,7 @@ int main()
 
   msg("Data consistency error!");
   pthread_mutex_lock(&shm->mutex);
-  shm->door_obstruction = 255U;
+  shm->door_obstruction = 255;
   pthread_mutex_unlock(&shm->mutex);
   pthread_cond_broadcast(&shm->cond);
   usleep(DELAY);
