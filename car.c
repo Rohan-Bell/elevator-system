@@ -34,7 +34,7 @@ int floor_compare(const char *f1, const char *f2);
 void move_towards_destination(void);
 void handle_buttons(void);
 int is_in_range(const char *floor);
-int my_usleep(__useconds_t usec); //Replacement for usleep as was getting errors with POSIX Source and wanted to use clock time
+int my_usleep(__useconds_t usec); //Replacement for usleep (getting errors with POSIX Source)
 
 
 //Setip the signal handler
@@ -49,7 +49,7 @@ void signal_handler(int sig){
         cleanup_in_progress = 1;
         if (shm) {
             pthread_mutex_lock(&shm->mutex);
-            pthread_cond_broadcast(&shm -> cond);
+            pthread_cond_broadcast(&shm->cond);
             pthread_mutex_unlock(&shm->mutex);
         }
     }
@@ -91,29 +91,52 @@ void init_shared_memory(void) {
 }
 
 
-/// @brief Connect to the controller using the socket address. Uses IPV4 not IPV6
-/// @param ssl_ctx The SSL context
-/// @return SSL* return (NULL if failed, SSL handle if success)
+// @brief Connects to the controller. This uses IPV6 with a fallback of IPV4 as it tries to meet NIST standards. Was having issues with IPV6 on a few tests
+/// @return int if succeeds sends socket fd, if fails sends -1
 int connect_to_controller(void) {
-    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    int sockfd = -1;
+    struct sockaddr_in6 addr6;
+    struct sockaddr_in addr4;
+    socklen_t addr_len;
+
+    // Try IPv6 first. This was not working for car tests 3 and 4 so going to ahve the fall back to ipv4
+    sockfd = socket(AF_INET6, SOCK_STREAM, 0);
+    if (sockfd != -1) {
+        memset(&addr6, 0, sizeof(addr6));
+        addr6.sin6_family = AF_INET6;
+        addr6.sin6_port = htons(CONTROLLER_PORT);
+        if (inet_pton(AF_INET6, CONTROLLER_IP, &addr6.sin6_addr) == 1) {
+            addr_len = sizeof(addr6);
+            if (connect(sockfd, (struct sockaddr *)&addr6, addr_len) == 0) {
+                goto send_registration;
+            }
+        }
+        close(sockfd);  // IPv6 failed, close and try IPv4
+    }
+
+    // Fallback to IPv4 for compatibility with test car 3 and car 4
+    sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd == -1) return -1;
 
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(CONTROLLER_PORT);
-    inet_pton(AF_INET, CONTROLLER_IP, &addr.sin_addr);
-
-    if (connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
+    memset(&addr4, 0, sizeof(addr4));
+    addr4.sin_family = AF_INET;
+    addr4.sin_port = htons(CONTROLLER_PORT);
+    if (inet_pton(AF_INET, CONTROLLER_IP, &addr4.sin_addr) != 1) {
         close(sockfd);
         return -1;
     }
 
-    /* Send CAR registration message over plain socket (length-prefixed)
-       Tests expect plain TCP, not SSL/TLS. */
-    char msg[256];
-    snprintf(msg, sizeof(msg), "CAR %s %s %s", car_name, lowest_floor, highest_floor);
-    send_message(sockfd, msg);
+    addr_len = sizeof(addr4);
+    if (connect(sockfd, (struct sockaddr *)&addr4, addr_len) == -1) {
+        close(sockfd);
+        return -1;
+    }
+
+send_registration:
+    /* Send CAR registration message over plain socket as the tests expect plain TCP*/
+    char buf[256];
+    snprintf(buf, sizeof(buf), "CAR %s %s %s", car_name, lowest_floor, highest_floor);
+    send_message(sockfd, buf);
 
     return sockfd;
 }
@@ -128,22 +151,24 @@ void disconnect_from_controller(void) {
 }
 
 void send_status_update(void) {
+    if (!shm) return; // Safety check
     pthread_mutex_lock(&controller_mutex);
     if (controller_fd != -1) {
-        char msg[256];
+        char buf[256];
         pthread_mutex_lock(&shm->mutex);
-        snprintf(msg, sizeof(msg), "STATUS %s %s %s", shm->status, shm->current_floor, shm->destination_floor);
+        snprintf(buf, sizeof(buf), "STATUS %s %s %s", shm->status, shm->current_floor, shm->destination_floor);
         pthread_mutex_unlock(&shm->mutex);
-        send_message(controller_fd, msg);
+        send_message(controller_fd, buf);
     }
     pthread_mutex_unlock(&controller_mutex);
 }
 
 /// @brief Performs a comaprsion between two floors 
-/// @param f1 First floor that is desired to be compared
-/// @param f2  Second floor that is desired to be compared
-/// @return Returns <0 if f1 < f2m 0 if equal and >0 if f1>f2
+/// @param f1 First floor to be compared
+/// @param f2  Second floor to be compared
+/// @return Returns less than 0 if f1 is greater than f2. Or 0 if equal and less than 0 if f1 is greater than f2
 int floor_compare(const char *f1, const char *f2) {
+    if (!f1 || !f2) return 0; // Safe default if NULL
     int i1 = floor_to_int(f1);
     int i2 = floor_to_int(f2);
     return i1 - i2;
@@ -155,6 +180,7 @@ int is_in_range(const char *floor) {
 }
 
 void move_one_floor_towards(char *current, const char *dest, size_t buffer_size) {
+    if (!current || !dest || buffer_size == 0) return; // Safety check
     int current_int = floor_to_int(current);
     int dest_int = floor_to_int(dest);
     if (current_int < dest_int) {
@@ -173,6 +199,7 @@ void move_one_floor_towards(char *current, const char *dest, size_t buffer_size)
 
 void *controller_thread(void *arg) {
     (void)arg;
+    if (!shm) return NULL; // Safety check
     while(!should_exit) {
         pthread_mutex_lock(&shm->mutex);
         //Wait for the safety system
@@ -224,10 +251,11 @@ void *controller_thread(void *arg) {
                 }
                 if (strncmp(recv_msg, "FLOOR", 5) == 0) {
                     char floor[8];
-                    sscanf(recv_msg + 6, "%s", floor);
+                    sscanf(recv_msg + 6, "%7s", floor); // Limit to 7 chars to prevent overflow
                     pthread_mutex_lock(&shm->mutex);
                     if (is_in_range(floor)) {
                         strncpy(shm->destination_floor, floor, sizeof(shm->destination_floor) -1);
+                        shm->destination_floor[sizeof(shm->destination_floor) -1] = '\0'; // Ensure null-termination
                         destination_changed = 1;
                         pthread_cond_broadcast(&shm->cond);
                     }
@@ -260,7 +288,7 @@ void open_door_sequence(void) {
     clock_gettime(CLOCK_MONOTONIC, &start_time);
     //printf("[TIMING] open_door_sequence START at %ld.%09ld\n", start_time.tv_sec, start_time.tv_nsec);
 
-    // --- Opening at t=0 ---
+    //Opens at t=0
     pthread_mutex_lock(&shm->mutex);
     shm->open_button = 0;
     strcpy(shm->status, "Opening");
@@ -269,18 +297,13 @@ void open_door_sequence(void) {
     //printf("[TIMING] Status set to Opening at t=0\n");
     send_status_update();
 
-    // --- Open at t=delay_ms ---
+    //Open at t=delay_ms
     struct timespec open_time = start_time;
     add_ms(&open_time, delay_ms);
-    //printf("[TIMING] Will transition to Open at t=%d ms (target: %ld.%09ld)\n", 
-        //    delay_ms, open_time.tv_sec, open_time.tv_nsec);
     clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &open_time, NULL);
 
     struct timespec now1;
     clock_gettime(CLOCK_MONOTONIC, &now1);
-
-    //printf("[TIMING] Woke up after %ld ms, transitioning to Open\n", elapsed1);
-
     pthread_mutex_lock(&shm->mutex);
     if(strcmp(shm->status, "Opening") == 0) {
         strcpy(shm->status, "Open");
@@ -289,24 +312,20 @@ void open_door_sequence(void) {
     pthread_mutex_unlock(&shm->mutex);
     send_status_update();
 
-    // --- Wait in Open state until close_button or t=2*delay_ms ---
+    //Wait in Open state until close_button or double the delay_ms
     struct timespec close_time = start_time;
     add_ms(&close_time, 2 * delay_ms);
-    //printf("[TIMING] Will auto-close at t=%d ms (target: %ld.%09ld)\n", 
-        //    2 * delay_ms, close_time.tv_sec, close_time.tv_nsec);
-
     while (1) {
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
 
         pthread_mutex_lock(&shm->mutex);
         
-        // 1. If user pressed close_button early
+        // If user pressed close_button early
         if (shm->close_button == 1 && strcmp(shm->status, "Open") == 0) {
             shm->close_button = 0;
             struct timespec close_button_time;
             clock_gettime(CLOCK_MONOTONIC, &close_button_time);
-            //printf("[TIMING] Close button pressed at t=%.3f ms, recalculating closed_time\n", elapsed * 1000);
             
             strcpy(shm->status, "Closing");
             pthread_cond_broadcast(&shm->cond);
@@ -323,7 +342,7 @@ void open_door_sequence(void) {
         
         pthread_mutex_unlock(&shm->mutex);
 
-        // 2. If scheduled close time has arrived
+        // If scheduled close time has arrived
         if ((now.tv_sec > close_time.tv_sec) ||
             (now.tv_sec == close_time.tv_sec && now.tv_nsec >= close_time.tv_nsec)) {
             //MING] Auto-close time reached at t=%ld ms, transitioning to Closing\n", elapsed_auto);
@@ -341,7 +360,7 @@ void open_door_sequence(void) {
         
     }
 
-    // --- Closing phase ---struct timespec closing_start;
+    //Closing phase
     struct timespec closing_start;
     clock_gettime(CLOCK_MONOTONIC, &closing_start);
     struct timespec new_closed_time = closing_start;
@@ -438,6 +457,7 @@ void handle_buttons(void) {
 
 void *main_operation_thread(void *arg) {
     (void)arg;
+    if (!shm) return NULL; // Safety check
     struct timespec last_safety_check;
     clock_gettime(CLOCK_MONOTONIC, &last_safety_check);
     

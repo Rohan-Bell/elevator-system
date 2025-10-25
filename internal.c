@@ -26,7 +26,7 @@ int get_floor_number(const char* floor) {
 
 
 
-/// @brief Get the enxt floor up. Need to consider that 0 is not a floor (ground)
+/// @brief Gets the mext floor up in the floors. The system must skip 0 as this is not a floor in both directions
 /// @param current The current floor on
 /// @param next  The desired floor
 /// @param n size of next buffer as was getting warnings
@@ -47,7 +47,7 @@ void get_next_floor_up(const char* current, char* next, size_t n) {
 }
 
 
-/// @brief Get the next floor down. Need to consider that 0 is not a floor (ground)
+/// @brief Gets the mext floor down in the floors. The system must skip 0 as this is not a floor in both directions
 /// @param current The current floor
 /// @param next  The desired floor
 void get_next_floor_down(const char* current, char* next, size_t n) {

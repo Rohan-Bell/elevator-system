@@ -6,36 +6,6 @@
  * client handler arguments  are used to avoid unbounded resources or issues 
  * with race conditions. This design is not fully MISRA C Compliant but is designed
  * to be robust.
- *
- * What I tried to do: 
- * 
- * 1. Minimize dynamic allocation
- *    The implementation uses fixed-size static arrays for car state and
- *    handler argument pools to bound memory usage.
- *
- * 2. Strict error checking and resource management
- *    Socket and thread-related calls are checked. On errors the code
- *    logs messages and attempts a safe/fail-close of file descriptors.
- *
- * 3. Concurrency and race conditions
- *    Shared state (cars[] and thread_args[]) is protected using
- *    separate mutexes. This was essential for race conditions
- *
- * 4. Signal handling
- *    SIGPIPE is ignored to avoid crashing on writes to closed sockets.
- *    SIGINT is handled by setting a volatile sig_atomic_t flag which
- *    the main loop polls for graceful shutdown.
- *
- * 5. Logging and snprintf
- *    The code uses snprintf to compose bounded log and protocol messages
- *    for convenience. In stricter safety contexts these should be
- *    replaced with lower-level, audited output routines.
- *
- * 6. Scheduling algorithm
- *    The controller computes an insertion point for incoming calls and
- *    assigns calls to the best car based on a pickup index heuristic and
- *    resulting queue length. The algorithm attempts to avoid unnecessary
- *    reversals and duplicate queue entries.
  */
 
 #include "shared.h"
@@ -203,7 +173,7 @@ int main() {
 }
 
 /**
- * @brief handles a single client connection in its own thread
+ * @brief handler for a single client connection. This is designed to run in own thread
  */
 void *client_handler_thread(void *arg) {
     int arg_idx = (intptr_t)arg;
@@ -313,7 +283,7 @@ void handle_car_connection(int client_fd, const char* initial_message) {
 }
 
 /**
- * @brief Handles a transient connection from a call pad
+ * @brief Handler for connection from a call pad to receive a floor from and to
  */
 void handle_call_connection(int client_fd, const char* call_message){
     int source_floor, dest_floor;
@@ -328,9 +298,7 @@ void handle_call_connection(int client_fd, const char* call_message){
 }
 
 /**
- * @brief Set up signal handlers for graceful shutdown as outlined by the task
- * (SIGINT), also for pipe errors (SIGPIPE)
- */
+ * @brief Sets up the signal handlers for shutdown. This is designed to be a graceful shutodnw as outlined by the task (SIGINT).  */
 
  void setup_signal_handlers(void) {
     //Ignore the SIGPIPE to prevent crashing on write to closed socket
@@ -346,7 +314,7 @@ void handle_call_connection(int client_fd, const char* call_message){
 
 
  /**
-  * @brief Async-signal safe handler for SIGINT
+  * @brief A safe handler for SIGINT that is async safe
   */
 void sigint_handler(int signum) {
     (void)signum;
@@ -358,11 +326,10 @@ void sigint_handler(int signum) {
  * SCHEDULING LOGIC 
  */
 
-
-/**
- * @brief Finds the best car for a request and updates queue
- */
-
+ /// @brief Schedules a request by finding the best car for a request and then updating thh queue
+ /// @param source_floor The floor the request came from
+ /// @param dest_floor  The floor that the ekevator will need to go to after they go to the source floor
+ /// @param client_fd Client file descriptor 
  void schedule_request(int source_floor, int dest_floor, int client_fd) {
     int best_car_idx = -1;
     int min_cost = 1000;
@@ -385,10 +352,6 @@ void sigint_handler(int signum) {
         /*
         Using the lowest cost by finding the earliest pickup index. If two
         have the same it is the shorter final queue length as a tiebreaker.
-        Cost is defined as the index of the pickup floor. A lower index means the
-        passenger will be picked up sooner relative to the car's current plan. This heuristic 
-        directly prioritizes passenger wait time for the new call. It is also a balanced approach
-        that isn't computationally inexpensive 
         */
 
         if (cost < min_cost || (cost == min_cost && final_len < best_final_len)) {
@@ -562,8 +525,7 @@ void sigint_handler(int signum) {
         
         next_segment:
             current = next;
-    }
-    //If no suitable insertion was found, append at end.
+    }    
     //The cost is higher, which means it is waiting for jobs to finish
     *pickup_idx = car->queue_size;
     *final_len = car->queue_size +2;

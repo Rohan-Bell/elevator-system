@@ -15,8 +15,6 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-#include <openssl/ssl.h>
-#include <openssl/err.h>
 #include "shared_mem.h"
 
 
@@ -43,14 +41,5 @@ void int_to_floor(int floor_int, char *floor_str, size_t size);
 void msg(const char *string);
 void reset_shm(car_shared_mem *s);
 void init_shm(car_shared_mem *s);
-
-// SSL versions of network functions
-void send_looped_ssl(SSL *ssl, const void *buf, size_t sz);
-char *receive_msg_ssl(SSL *ssl);
-void send_message_ssl(SSL *ssl, const char *buf);
-
-// SSL context initialization
-SSL_CTX *init_ssl_context(void);
-SSL_CTX *init_ssl_client_context(void);
 
 #endif
