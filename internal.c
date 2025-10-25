@@ -17,11 +17,20 @@ int is_basement_floor(const char* floor) {
 }
 
 int get_floor_number(const char* floor) {
+    if (floor == NULL) return 0;
+    char *endptr = NULL;
+    long v = 0;
+    errno = 0;
     if (is_basement_floor(floor)) {
-        return atoi(floor + 1);
+        v = strtol(floor + 1, &endptr, 10);
     } else {
-        return atoi(floor);
+        v = strtol(floor, &endptr, 10);
     }
+    if (endptr == NULL || *endptr != '\0' || errno == ERANGE) {
+        /* Fall back to 0 on parse error*/
+        return 0;
+    }
+    return (int)v;
 }
 
 
@@ -144,13 +153,14 @@ int main(int argc, char **argv) {
         }
         //We have passed all our checks
         //Set the desitation to next floor up
-        char next_floor[12];
-        get_next_floor_up(shm->current_floor, next_floor, sizeof(next_floor));
-        strcpy(shm->destination_floor, next_floor);
+    char next_floor[12];
+    get_next_floor_up(shm->current_floor, next_floor, sizeof(next_floor));
+    /* bounded copy ensuring null-termination to avoid overflow */
+    (void)strncpy(shm->destination_floor, next_floor, sizeof(shm->destination_floor) - 1);
+    shm->destination_floor[sizeof(shm->destination_floor) - 1] = '\0';
 
      } else if (strcmp(operation, "down") == 0) {
-        //Maybe we do these checks in a function?
-        //We want to go up. Lets see if we are even allowed to go up./
+        //We want to go up. Lets see if we are even allowed to go up.
         if(!shm -> individual_service_mode) {
             pthread_mutex_unlock(&shm->mutex); //We open the mutex before exiting so other processes don't deadlock
             //operation is only allowed in service mode
@@ -173,9 +183,10 @@ int main(int argc, char **argv) {
         }
         //We have passed all our checks
         //Set the desitation to next floor up
-        char next_floor[12];
-        get_next_floor_down(shm->current_floor, next_floor, sizeof(next_floor));
-        strcpy(shm->destination_floor, next_floor);
+    char next_floor[12];
+    get_next_floor_down(shm->current_floor, next_floor, sizeof(next_floor));
+    (void)strncpy(shm->destination_floor, next_floor, sizeof(shm->destination_floor) - 1);
+    shm->destination_floor[sizeof(shm->destination_floor) - 1] = '\0';
         
      } else {
         //Something else that we are not considering was inputted into the terminal

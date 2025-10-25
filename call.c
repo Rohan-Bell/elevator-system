@@ -54,16 +54,23 @@ int main(int argc, char **argv) {
     //Receive the response
     char *response = receive_msg(sockfd);
 
-    //Process the resposne 
-    if(strncmp(response, "CAR ", 4) == 0) {
-        //print tje server response
+    // receive_msg returns NULL on error
+    if (response == NULL) {
+        printf("Unable to connect to elevator system.\n");
+        close(sockfd);
+        exit(1);
+    }
+
+    //Process the response
+    if (strncmp(response, "CAR ", 4) == 0) {
+        //print the server response
         printf("Car %s is arriving.\n", response + 4);
-    } else if(strcmp(response,"UNAVAILABLE") == 0) {
+    } else if (strcmp(response, "UNAVAILABLE") == 0) {
         printf("Sorry, no car is available to take this request.\n");
     } else {
         printf("Unable to connect to elevator system.\n");
     }
-    free(response); //free the memeory up
+    free(response); //free the memory up
     if(close(sockfd) == -1) {
         perror("close()");
         exit(1);
