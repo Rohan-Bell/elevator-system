@@ -7,3 +7,6 @@ display-cars: display-cars.c
 clean:
 	rm -f $(TESTERS) display-cars
 .PHONY: testers clean
+
+test-controller-2: test-controller-2.c ../shared_utils.o
+	$(CC) $(CFLAGS) test-controller-2.c ../shared_utils.o -lssl -lcrypto -o test-controller-2
