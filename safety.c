@@ -99,6 +99,12 @@ static int check_data_consistency(car_shared_mem* shm);
 static void safe_write(int fd, const char *message); // This is to not use printf
 static int construct_shm_name(char *dest, size_t dest_size, const char *car_name);
 
+/* Helpers to reduce repeated patterns and centralise emergency handling */
+static void safety_escalate_and_log(car_shared_mem* shm, const char *msg);
+static void bounded_strncpy(char *dst, const char *src, size_t dst_size);
+static int parse_and_check_range(const char *s, long *out, long min, long max);
+static int safety_lock_and_wait(car_shared_mem* shm);
+
 int main(int argc, char *argv[]){
     if (argc != EXPECTED_ARGC) {
         //Deviation from MISRA C Use of exit() is permissible only in initialization failures where continued operation would be unsafe.
@@ -131,30 +137,11 @@ int main(int argc, char *argv[]){
     while(1) {
             /* Acquire the mutex and check return code. If lock fails, escalate to
                emergency mode and retry after a short sleep to avoid spinning. */
-            int rc = pthread_mutex_lock(&shm->mutex);
-            if (rc != 0) {
-                safe_write(STDERR_FD, "Mutex lock failed in safety system.\n");
-                put_car_in_emergency_mode(shm);
-                /* Back off briefly to avoid tight loop */
-                (void)sleep(1);
-                continue;
-            }
-
-            /* Wait for a change in shared memory. Handle interrupts (EINTR) by
-               retrying; any other error escalates to emergency mode. */
-            int wait_rc = pthread_cond_wait(&shm->cond, &shm->mutex);
-            while (wait_rc != 0) {
-                if (wait_rc == EINTR) {
-                    /* Interrupted by a signal, retry waiting */
-                    wait_rc = pthread_cond_wait(&shm->cond, &shm->mutex);
-                    continue;
-                }
-                safe_write(STDERR_FD, "Condition wait failed in safety system.\n");
-                put_car_in_emergency_mode(shm);
-                break;
-            }
-
-            if (wait_rc == 0) {
+            /* Acquire the mutex and wait for a change in shared memory using
+               the helper that centralises EINTR handling and error escalation.
+               On success the mutex is held and we can perform checks. */
+            int wait_err = safety_lock_and_wait(shm);
+            if (wait_err == 0) {
                 //handle a heartbeat check to ensure everything is all good
                 handle_safety_system_heartbeat(shm);
 
@@ -173,9 +160,9 @@ int main(int argc, char *argv[]){
                 }
             }
 
-            /* Unlock the mutex; ignore unlock return for compatibility with the
-               rest of the code, but call is performed. */
-            (void)pthread_mutex_unlock(&shm->mutex);
+                /* Unlock the mutex; ignore unlock return for compatibility with the
+                    rest of the code, but call is performed. */
+                (void)pthread_mutex_unlock(&shm->mutex);
     }
     //The code should never reach here. But just in case unmap the memory and return
     (void)munmap(shm, sizeof(car_shared_mem));
@@ -194,31 +181,27 @@ static void handle_safety_system_heartbeat(car_shared_mem* shm) {
 
 static void handle_door_obstruction(car_shared_mem* shm) {
     if ((shm->door_obstruction == BOOLEAN_TRUE_VALUE) && (strcmp(shm->status, "Closing") == 0)) {
-        /* Using strncpy for bounded string copy rule 21.6 */
-        (void)strncpy(shm->status, "Opening", sizeof(shm->status) - 1U); /* Something got stuck in door open the door */
-        shm->status[sizeof(shm->status) - 1U] = '\0'; /* Null-termination is ensured by forcing it. */
+        /* Use bounded_strncpy helper to ensure consistent bounded-copy semantics. */
+        bounded_strncpy(shm->status, "Opening", sizeof(shm->status)); /* Something got stuck in door open the door */
     }
 }
 
 static void handle_emergency_stop(car_shared_mem* shm) {
     if ((shm->emergency_stop == BOOLEAN_TRUE_VALUE) && (shm->emergency_mode == BOOLEAN_FALSE_VALUE)) {
         //If e stop is hit and not already in e stop mode 
-        safe_write(STDERR_FD,"The emergency stop button has been pressed!\n");
-        put_car_in_emergency_mode(shm);
+        safety_escalate_and_log(shm, "The emergency stop button has been pressed!\n");
         shm->emergency_stop = BOOLEAN_FALSE_VALUE;
     }
 }
 
 static void handle_overload(car_shared_mem* shm) {
     if ((shm->overload == BOOLEAN_TRUE_VALUE) && (shm->emergency_mode == BOOLEAN_FALSE_VALUE)) {
-        safe_write(STDERR_FD,"The overload sensor has been tripped!\n");
-        put_car_in_emergency_mode(shm);
+        safety_escalate_and_log(shm, "The overload sensor has been tripped!\n");
     }
 }
 
 static void handle_data_consistency_error(car_shared_mem* shm) {
-    safe_write(STDERR_FD,"Data consistency error!\n");
-    put_car_in_emergency_mode(shm);
+    safety_escalate_and_log(shm, "Data consistency error!\n");
 }
 
 static void put_car_in_emergency_mode(car_shared_mem* shm) {
@@ -267,59 +250,107 @@ static int check_data_consistency(car_shared_mem* shm) {
 }
 
 static int validate_floor_string(const char* floor) {
-    int result = 0;
-
     if (floor == NULL) {
-        result = 0;
-    } else {
-        /* Manual length check to replace strnlen */
-        size_t len = 0;
-        while ((len < (MAX_FLOOR_STRING_LENGTH + 2U)) && (floor[len] != '\0')) {
-            len++;
-        }
-        if((len == 0U) || (len > MAX_FLOOR_STRING_LENGTH)) {
-            result = 0; /* Improper floor size. */
-        } else {
-            long converted_num;
-            char *endptr;
-            if(floor[0] == 'B') {
-                /* It is a basement floor */
-                if(len < 2U) {
-                    result = 0; /* check character sizing */
-                } else {
-                    errno = 0; /* Reset errno before the call */
-                    converted_num = strtol(&floor[1], &endptr, 10);
-                    /* Deviation from MISRA C errno is tested immediately after strtol (an errno-setting function) in a thread-safe manner for safety-critical validation. */
-                    if ((endptr == &floor[1]) || (*endptr != '\0') || (errno == ERANGE)) {
-                        result = 0; /* Not a valid number or out of range */
-                    } else {
-                        if ((converted_num >= BASEMENT_MIN_LEVEL) && (converted_num <= BASEMENT_MAX_LEVEL)) {
-                            result = 1;
-                        } else {
-                            result = 0;
-                        }
-                    }
-                }
-            } else {
-                /* regular floor */
-                errno = 0; /* Reset errno before the call */
-                converted_num = strtol(floor, &endptr, 10);
+        return 0;
+    }
 
-                /* Deviation from MISRA C errno is tested immediately after strtol (an errno-setting function) in a thread-safe manner for safety-critical validation. */
-                if ((endptr == floor) || (*endptr != '\0') || (errno == ERANGE)) {
-                    result = 0; /* Not a valid number or out of range */
-                } else {
-                    if ((converted_num >= FLOOR_MIN_LEVEL) && (converted_num <= FLOOR_MAX_LEVEL)) {
-                        result = 1;
-                    } else {
-                        result = 0;
-                    }
-                }
-            }
+    /* Manual length check to replace strnlen (preserve original limits) */
+    size_t len = 0;
+    while ((len < (MAX_FLOOR_STRING_LENGTH + 2U)) && (floor[len] != '\0')) {
+        len++;
+    }
+    if ((len == 0U) || (len > MAX_FLOOR_STRING_LENGTH)) {
+        return 0; /* Improper floor size. */
+    }
+
+    long converted_num = 0L;
+    if (floor[0] == 'B') {
+        /* Basement floor: require at least one digit after 'B' */
+        if (len < 2U) {
+            return 0;
+        }
+        if (parse_and_check_range(&floor[1], &converted_num, BASEMENT_MIN_LEVEL, BASEMENT_MAX_LEVEL) == 0) {
+            return 0;
+        }
+    } else {
+        /* Regular floor */
+        if (parse_and_check_range(floor, &converted_num, FLOOR_MIN_LEVEL, FLOOR_MAX_LEVEL) == 0) {
+            return 0;
         }
     }
 
-    return result;
+    /* Passed all checks */
+    return 1;
+}
+
+/* Helper implementations */
+
+/// @brief When called calles safe_write() with the message, and then puts the car in emergency mode
+/// @param shm Shared memory to put the car in emergency mode
+/// @param msg Message that will be written to logs
+static void safety_escalate_and_log(car_shared_mem* shm, const char *msg) {
+    /* centralised emergency logging + escalation */
+    safe_write(STDERR_FD, msg);
+    put_car_in_emergency_mode(shm);
+}
+
+static void bounded_strncpy(char *dst, const char *src, size_t dst_size) {
+    if ((dst == NULL) || (src == NULL) || (dst_size == 0U)) {
+        return;
+    }
+    size_t i = 0U;
+    /* copy up to dst_size - 1 characters */
+    while ((i + 1U) < dst_size && src[i] != '\0') {
+        dst[i] = src[i];
+        i++;
+    }
+    /* ensure null termination */
+    dst[i] = '\0';
+}
+
+static int parse_and_check_range(const char *s, long *out, long min, long max) {
+    if ((s == NULL) || (out == NULL)) {
+        return 0;
+    }
+    errno = 0;
+    char *endptr = NULL;
+    long v = strtol(s, &endptr, 10);
+    if ((endptr == s) || (*endptr != '\0') || (errno == ERANGE)) {
+        return 0;
+    }
+    if ((v < min) || (v > max)) {
+        return 0;
+    }
+    *out = v;
+    return 1;
+}
+
+/// @brief A helper function that locks the mutex, safely escaleates the system and passes the message and then waits using cond
+/// @param shm shared memory
+/// @return 0 if mkutex is held -1 if something goes wrong that is unexpected
+static int safety_lock_and_wait(car_shared_mem* shm) {
+    int rc = pthread_mutex_lock(&shm->mutex);
+    if (rc != 0) {
+        safety_escalate_and_log(shm, "Mutex lock failed in safety system.\n");
+        /* Back off briefly to avoid tight loop */
+        (void)sleep(1);
+        return -1;
+    }
+
+    int wait_rc;
+    do {
+        wait_rc = pthread_cond_wait(&shm->cond, &shm->mutex);
+    } while (wait_rc == EINTR);
+
+    if (wait_rc != 0) {
+        safety_escalate_and_log(shm, "Condition wait failed in safety system.\n");
+        /* unlock mutex before returning */
+        (void)pthread_mutex_unlock(&shm->mutex);
+        return -2;
+    }
+
+    /* success: mutex is held */
+    return 0;
 }
 
 static int validate_status_string(const char* status) {
